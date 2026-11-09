@@ -20,7 +20,7 @@ kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarg
 dependencies {
     // ZXing's core: the QR encoder and decoder (pure Java, Apache-2.0, no
     // Play Services). CameraX: Android's own camera library (AOSP).
-    implementation("com.google.zxing:core:3.5.3")
+    implementation("com.google.zxing:core:3.5.4")
     val camerax = "1.4.1"
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
