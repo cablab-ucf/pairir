@@ -3,17 +3,20 @@
 
 #![forbid(unsafe_code)]
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use chacha20poly1305::{
     KeyInit, XChaCha20Poly1305,
     aead::{Aead, Payload},
 };
-use iroh::{EndpointAddr, RelayUrl, SecretKey, TransportAddr, endpoint::Builder};
+use curve25519_dalek::traits::IsIdentity;
+use curve25519_dalek::{RistrettoPoint, Scalar, ristretto::CompressedRistretto};
+use iroh::endpoint::{Builder, Connection};
+use iroh::{Endpoint, EndpointAddr, RelayUrl, SecretKey, TransportAddr};
 use rand_chacha::{
     ChaCha20Rng,
     rand_core::{Rng, SeedableRng},
 };
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use std::{sync::Mutex, time::Duration};
 use tokio::{io::AsyncReadExt, task::JoinSet, time::timeout};
 use x_wing::kem::Ciphertext;
@@ -23,9 +26,12 @@ use zeroize::Zeroizing;
 
 /// How long a code is answered.
 pub const TTL: Duration = Duration::from_secs(60);
-const ALPN: &[u8] = b"irpair/1";
+const ALPN: &[u8] = b"irpair/2";
 const ABC: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 const LEN: usize = 9;
+/// The code's first group, its nameplate: public, it only finds the giver.
+const PLATE: usize = 3;
+const EK: usize = 1216;
 const KEM_CT: usize = 1120;
 const MAX: usize = 1 << 16;
 pub const SECRET: usize = 32 << 10;
@@ -41,7 +47,7 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// OS randomness hashed with a secret (RFC 8937): a rigged RNG alone
-/// predicts nothing.
+/// predicts nothing the secret does not.
 fn hedged(secret: &[u8]) -> ChaCha20Rng {
     ChaCha20Rng::from_seed(
         Sha256::new().chain_update(rand::<32>()).chain_update(secret).finalize().into(),
@@ -83,36 +89,104 @@ fn minute() -> u64 {
 }
 
 fn argon(secret: &[u8], salt: &[u8], out: &mut [u8], m: u32, t: u32) -> Result<()> {
-    let p = argon2::Params::new(m, t, 1, None).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let p = argon2::Params::new(m, t, 1, None).map_err(|e| anyhow!("{e}"))?;
     argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, p)
         .hash_password_into(secret, salt, out)
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(|e| anyhow!("{e}"))
 }
 
-/// A code's identity and proof, for `app`, given in minute `m`.
-fn keys(app: &str, code: &str, m: u64) -> Result<(SecretKey, [u8; 32])> {
-    let salt = [b"irpair 1 ", app.as_bytes(), b" ", &m.to_le_bytes()].concat();
-    let mut k = Zeroizing::new([0u8; 64]);
-    // 2^45 guesses within a minute: cheap is enough.
-    argon(norm(code)?.as_bytes(), &salt, &mut k[..], 19 << 10, 2)?;
-    let (sk, proof) = k.split_at(32);
-    Ok((SecretKey::from_bytes(sk.try_into()?), proof.try_into()?))
-}
-
-async fn stretched(app: &str, code: &str, m: u64) -> Result<(SecretKey, [u8; 32])> {
-    let (app, code) = (app.to_string(), code.to_string());
-    tokio::task::spawn_blocking(move || keys(&app, &code, m)).await?
-}
-
-/// A password's key, salted by the code's proof: holds if X-Wing falls.
-async fn locked(password: &str, proof: [u8; 32]) -> Result<Zeroizing<[u8; 32]>> {
+/// A password's key (Argon2id 256 MiB, 4 passes) for `app` and a salt.
+async fn locked(
+    tag: &str,
+    app: &str,
+    password: &str,
+    salt: [u8; 16],
+) -> Result<Zeroizing<[u8; 32]>> {
     ensure!(!password.is_empty(), "empty password");
+    let salt = [tag.as_bytes(), app.as_bytes(), b" ", &salt].concat();
     let p = Zeroizing::new(password.to_string());
     tokio::task::spawn_blocking(move || {
         let mut k = Zeroizing::new([0u8; 32]);
-        argon(p.as_bytes(), &proof, &mut k[..], 256 << 10, 4).map(|_| k)
+        argon(p.as_bytes(), &salt, &mut k[..], 256 << 10, 4).map(|_| k)
     })
     .await?
+}
+
+/// Length-value encoding (CPace's lv_cat): each part after its LEB128 length.
+fn lv(parts: &[&[u8]]) -> Vec<u8> {
+    let mut v = vec![];
+    for p in parts {
+        let mut n = p.len();
+        while n >= 128 {
+            v.push(n as u8 | 0x80);
+            n >>= 7;
+        }
+        v.push(n as u8);
+        v.extend_from_slice(p);
+    }
+    v
+}
+
+/// The giver's rendezvous key, from the nameplate alone: anyone may derive
+/// it, so TLS hides the handoff but proves nothing; CPace does.
+fn meet(app: &str, plate: &str, m: u64) -> SecretKey {
+    let h =
+        Sha256::digest(lv(&[b"irpair 2 meet", app.as_bytes(), &m.to_le_bytes(), plate.as_bytes()]));
+    SecretKey::from_bytes(&h.into())
+}
+
+// CPace (draft-irtf-cfrg-cpace-21), CPACE-RISTR255-SHA512: the taker
+// initiates, the giver responds. PRS: the code after its nameplate. CI: the
+// app. sid: the TLS exporter. ADa: the taker's X-Wing key. ADb: empty.
+
+const DSI: &[u8] = b"CPaceRistretto255";
+
+fn generator(prs: &[u8], ci: &[u8], sid: &[u8]) -> RistrettoPoint {
+    let zpad = 128usize.saturating_sub(lv(&[prs]).len() + lv(&[DSI]).len() + 1);
+    let h: [u8; 64] = Sha512::digest(lv(&[DSI, prs, &vec![0; zpad], ci, sid])).into();
+    RistrettoPoint::from_uniform_bytes(&h)
+}
+
+/// A scalar of 252 random bits, as the draft recommends, and its share.
+fn share(g: RistrettoPoint, rng: &mut ChaCha20Rng) -> (Zeroizing<Scalar>, [u8; 32]) {
+    let mut b = Zeroizing::new([0u8; 32]);
+    rng.fill_bytes(&mut *b);
+    b[31] &= 0x0f;
+    let y = Zeroizing::new(Scalar::from_bytes_mod_order(*b));
+    let ours = (g * *y).compress().to_bytes();
+    (y, ours)
+}
+
+/// ISK for `y` and the peer's share; `None` if the share fails to decode or
+/// yields the identity.
+fn isk(y: &Scalar, theirs: &[u8], sid: &[u8], transcript: &[u8]) -> Option<Zeroizing<[u8; 64]>> {
+    let k = CompressedRistretto::from_slice(theirs).ok()?.decompress()? * y;
+    if k.is_identity() {
+        return None;
+    }
+    let h = Sha512::new()
+        .chain_update(lv(&[b"CPaceRistretto255_ISK", sid, k.compress().as_bytes()]))
+        .chain_update(transcript)
+        .finalize();
+    Some(Zeroizing::new(h.into()))
+}
+
+/// The CPace generator and sid both ends derive, bound to `c`.
+fn cpace(c: &Connection, app: &str, pw: &str) -> Result<(RistrettoPoint, [u8; 32])> {
+    let mut sid = [0; 32];
+    c.export_keying_material(&mut sid, b"EXPORTER-irpair-cpace", b"")
+        .map_err(|e| anyhow!("tls exporter: {e:?}"))?;
+    Ok((generator(pw.as_bytes(), &lv(&[b"irpair 2", app.as_bytes()]), &sid), sid))
+}
+
+/// The taker's proof that it holds the code, before the giver answers.
+fn proof(isk: &[u8]) -> [u8; 32] {
+    Sha256::digest(lv(&[b"irpair 2 taker", isk])).into()
+}
+
+/// The answer's key: CPace and X-Wing together, so it holds while either does.
+fn key(isk: &[u8], ss: &[u8]) -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(Sha256::digest(lv(&[b"irpair 2 key", isk, ss])).into())
 }
 
 async fn rest(rx: &mut iroh::endpoint::RecvStream, max: usize) -> Result<Vec<u8>> {
@@ -131,45 +205,58 @@ pub async fn give(ep: Builder, app: &str, secret: &[u8], password: Option<&str>)
     rng.fill_bytes(&mut c);
     let c: String = c.iter().map(|b| ABC[*b as usize % 32] as char).collect();
     let code = format!("{}-{}-{}", &c[..3], &c[3..6], &c[6..]);
-    let (sk, proof) = stretched(app, &code, minute()).await?;
     let body = Zeroizing::new(match password {
         None => [&[0][..], secret].concat(),
-        Some(p) => [&[1][..], &seal(&*locked(p, proof).await?, secret, &mut rng)].concat(),
+        Some(p) => {
+            let mut salt = [0u8; 16];
+            rng.fill_bytes(&mut salt);
+            let k = locked("irpair 2 ", app, p, salt).await?;
+            [&[1][..], &salt, &seal(&k, secret, &mut rng)].concat()
+        }
     });
-    let ep = ep.secret_key(sk).alpns(vec![ALPN.to_vec()]).bind().await?;
+    let ep = ep.secret_key(meet(app, &c[..PLATE], minute())).alpns(vec![ALPN.to_vec()]);
+    let ep = ep.bind().await?;
     let _ = timeout(Duration::from_secs(10), ep.online()).await;
+    let (app, pw) = (app.to_string(), Zeroizing::new(c[PLATE..].to_string()));
     tokio::spawn(async move {
-        let one = async {
-            let c = ep.accept().await?.await.ok()?;
-            let (mut tx, mut rx) = c.accept_bi().await.ok()?;
-            let b = rest(&mut rx, 32 + 2048).await.ok()?;
-            let (got, pk) = b.split_at_checked(32)?;
-            // One try: right or wrong, the code is spent.
-            let sealed = same(got, &proof).then(|| kem_seal(pk, &body, &mut rng))??;
-            tx.write_all(&sealed).await.ok()?;
-            tx.finish().ok()?;
-            let _ = timeout(Duration::from_secs(5), c.closed()).await;
-            Some(())
-        };
-        let _ = timeout(TTL, one).await;
+        // One try: right or wrong, the code is spent.
+        let _ = timeout(TTL, answer(&ep, &app, &pw, &body, &mut rng)).await;
         ep.close().await;
     });
     Ok(code)
 }
 
-fn kem_seal(pk: &[u8], msg: &[u8], rng: &mut ChaCha20Rng) -> Option<Vec<u8>> {
-    let (ct, ss) = EncapsulationKey::try_from(pk).ok()?.encapsulate_with_rng(rng);
-    Some([&ct[..], &seal(&Zeroizing::new(ss.into()), msg, rng)].concat())
-}
-
-fn kem_open(dk: &DecapsulationKey, b: &[u8]) -> Option<Vec<u8>> {
-    let (ct, rest) = b.split_at_checked(KEM_CT)?;
-    let ct = Ciphertext::<XWingKem>::try_from(ct).ok()?;
-    open(&Zeroizing::new(dk.decapsulate(&ct).into()), rest)
+async fn answer(
+    ep: &Endpoint,
+    app: &str,
+    pw: &str,
+    body: &[u8],
+    rng: &mut ChaCha20Rng,
+) -> Option<()> {
+    let c = ep.accept().await?.await.ok()?;
+    let (mut tx, mut rx) = c.accept_bi().await.ok()?;
+    let mut m = [0u8; 32 + EK];
+    rx.read_exact(&mut m).await.ok()?;
+    let (ya, ek) = m.split_at(32);
+    let (g, sid) = cpace(&c, app, pw).ok()?;
+    let (y, yb) = share(g, rng);
+    tx.write_all(&yb).await.ok()?;
+    let isk = isk(&y, ya, &sid, &lv(&[ya, ek, &yb, b""]))?;
+    let mut got = [0u8; 32];
+    rx.read_exact(&mut got).await.ok()?;
+    if !same(&got, &proof(&*isk)) {
+        return None;
+    }
+    let (ct, ss) = EncapsulationKey::try_from(ek).ok()?.encapsulate_with_rng(rng);
+    let ss: Zeroizing<[u8; 32]> = Zeroizing::new(ss.into());
+    tx.write_all(&[&ct[..], &seal(&key(&*isk, &*ss), body, rng)].concat()).await.ok()?;
+    tx.finish().ok()?;
+    let _ = timeout(Duration::from_secs(5), c.closed()).await;
+    Some(())
 }
 
 /// The last locked secret taken, for a password given after its one try.
-type Held = (String, String, [u8; 32], Vec<u8>);
+type Held = (String, String, Vec<u8>);
 static HELD: Mutex<Option<Held>> = Mutex::new(None);
 
 /// The secret a short code stands for, from its giver on `relays`.
@@ -183,44 +270,48 @@ pub async fn take(
     let code = norm(code)?;
     let held =
         HELD.lock().unwrap_or_else(|e| e.into_inner()).take_if(|h| h.0 == app && h.1 == code);
-    if let Some((_, code, proof, b)) = held {
-        return unlock(app, code, proof, b, password).await;
+    if let Some((_, code, b)) = held {
+        return unlock(app, code, b, password).await;
     }
-    let m = minute();
-    let mut tries = vec![];
-    for m in [m.saturating_sub(1), m, m + 1] {
-        tries.push(stretched(app, &code, m).await?);
-    }
-    let mut seed = [0u8; 32];
-    hedged(code.as_bytes()).fill_bytes(&mut seed);
-    let dk: DecapsulationKey = seed.into();
+    let (plate, pw) = code.split_at(PLATE);
+    let mut rng = hedged(code.as_bytes());
+    let mut seed = Zeroizing::new([0u8; 32]);
+    rng.fill_bytes(&mut *seed);
+    let dk: DecapsulationKey = (*seed).into();
     let ek = dk.encapsulation_key().to_bytes();
     let ep = ep.bind().await?;
     let go = async {
-        // This minute's identity or a neighbour's (clock skew).
+        // This minute's rendezvous or a neighbour's (clock skew).
+        let m = minute();
         let mut dials = JoinSet::new();
-        for (sk, proof) in tries {
+        for m in [m.saturating_sub(1), m, m + 1] {
             let (ep, to) = (ep.clone(), relays.iter().cloned().map(TransportAddr::Relay));
-            let at = EndpointAddr::from_parts(sk.public(), to);
+            let at = EndpointAddr::from_parts(meet(app, plate, m).public(), to);
             dials.spawn(async move {
                 loop {
                     match ep.connect(at.clone(), ALPN).await {
-                        Ok(c) => break (c, proof),
+                        Ok(c) => break c,
                         Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
                     }
                 }
             });
         }
-        let (c, proof) = dials.join_next().await.context("no code")??;
+        let c = dials.join_next().await.context("no code")??;
         drop(dials);
+        let (g, sid) = cpace(&c, app, pw)?;
+        let (y, ya) = share(g, &mut rng);
         let (mut tx, mut rx) = c.open_bi().await?;
-        tx.write_all(&[&proof[..], &ek].concat()).await?;
+        tx.write_all(&[&ya[..], &ek].concat()).await?;
+        let mut yb = [0u8; 32];
+        rx.read_exact(&mut yb).await?;
+        let isk = isk(&y, &yb, &sid, &lv(&[&ya, &ek, &yb, b""])).context("not a code's answer")?;
+        tx.write_all(&proof(&*isk)).await?;
         tx.finish()?;
-        let b = rest(&mut rx, MAX).await?;
-        let body = Zeroizing::new(kem_open(&dk, &b).context("that code was used or is wrong")?);
-        match body.split_first() {
+        let b = rest(&mut rx, MAX).await.unwrap_or_default();
+        let body = kem_open(&dk, &*isk, &b).context("that code was used or is wrong")?;
+        match Zeroizing::new(body).split_first() {
             Some((0, s)) => Ok(Zeroizing::new(s.to_vec())),
-            Some((1, s)) => unlock(app, code, proof, s.to_vec(), password).await,
+            Some((1, s)) => unlock(app, code.clone(), s.to_vec(), password).await,
             _ => bail!("not a code's secret"),
         }
     };
@@ -229,19 +320,26 @@ pub async fn take(
     r.unwrap_or_else(|_| bail!("nobody answers that code: wrong, or past its minute"))
 }
 
+fn kem_open(dk: &DecapsulationKey, isk: &[u8], b: &[u8]) -> Option<Vec<u8>> {
+    let (ct, rest) = b.split_at_checked(KEM_CT)?;
+    let ct = Ciphertext::<XWingKem>::try_from(ct).ok()?;
+    let ss: Zeroizing<[u8; 32]> = Zeroizing::new(dk.decapsulate(&ct).into());
+    open(&key(isk, &*ss), rest)
+}
+
 async fn unlock(
     app: &str,
     code: String,
-    proof: [u8; 32],
     b: Vec<u8>,
     password: Option<&str>,
 ) -> Result<Zeroizing<Vec<u8>>> {
     if let Some(p) = password
-        && let Some(s) = open(&*locked(p, proof).await?, &b)
+        && let Some((salt, ct)) = b.split_at_checked(16)
+        && let Some(s) = open(&*locked("irpair 2 ", app, p, salt.try_into()?).await?, ct)
     {
         return Ok(Zeroizing::new(s));
     }
-    *HELD.lock().unwrap_or_else(|e| e.into_inner()) = Some((app.into(), code, proof, b));
+    *HELD.lock().unwrap_or_else(|e| e.into_inner()) = Some((app.into(), code, b));
     bail!(if password.is_some() { "wrong password" } else { "that code has a password" })
 }
 
@@ -255,25 +353,14 @@ pub fn password() -> String {
 const QR: &str = "IRPAIR1:";
 pub const QR_SECRET: usize = 2 << 10;
 
-async fn qr_key(app: &str, password: &str, salt: [u8; 16]) -> Result<Zeroizing<[u8; 32]>> {
-    let salt = [b"irpair qr 1 ", app.as_bytes(), b" ", &salt].concat();
-    let p = Zeroizing::new(password.to_string());
-    tokio::task::spawn_blocking(move || {
-        let mut k = Zeroizing::new([0u8; 32]);
-        argon(p.as_bytes(), &salt, &mut k[..], 256 << 10, 4).map(|_| k)
-    })
-    .await?
-}
-
 /// An offline QR code's text: `secret` under `password` alone (Argon2id
 /// 256 MiB, XChaCha20-Poly1305), so make it [`password`].
 pub async fn seal_qr(app: &str, secret: &[u8], password: &str) -> Result<String> {
     ensure!(secret.len() <= QR_SECRET, "over {QR_SECRET} bytes: too long for a QR code");
-    ensure!(!password.is_empty(), "empty password");
     let mut rng = hedged(&[secret, password.as_bytes()].concat());
     let mut salt = [0u8; 16];
     rng.fill_bytes(&mut salt);
-    let ct = seal(&*qr_key(app, password, salt).await?, secret, &mut rng);
+    let ct = seal(&*locked("irpair qr 1 ", app, password, salt).await?, secret, &mut rng);
     Ok(format!("{QR}{}", data_encoding::BASE32_NOPAD.encode(&[&salt[..], &ct].concat())))
 }
 
@@ -281,7 +368,7 @@ pub async fn open_qr(app: &str, text: &str, password: &str) -> Result<Zeroizing<
     let body = text.trim().strip_prefix(QR).context("not an irpair QR code")?;
     let b = data_encoding::BASE32_NOPAD.decode(body.as_bytes()).context("not an irpair QR code")?;
     let (salt, ct) = b.split_at_checked(16).context("not an irpair QR code")?;
-    let k = qr_key(app, password, salt.try_into()?).await?;
+    let k = locked("irpair qr 1 ", app, password, salt.try_into()?).await?;
     open(&k, ct).map(Zeroizing::new).context("wrong password, or another app's code")
 }
 
@@ -303,15 +390,51 @@ mod tests {
         iroh::Endpoint::builder(presets::Minimal).relay_mode(RelayMode::custom([r.clone()]))
     }
 
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    fn scalar(s: &str) -> Scalar {
+        Scalar::from_bytes_mod_order(hex(s).try_into().unwrap())
+    }
+
     #[test]
-    fn codes_read_as_typed_and_change_each_minute_and_app() {
-        let a = keys("x", "k7m-x9q-p3a", 1).unwrap();
-        assert_eq!(a.0.public(), keys("x", "K7M X9Q P3A", 1).unwrap().0.public());
+    fn codes_read_as_typed_and_meet_by_nameplate_minute_and_app() {
+        assert_eq!(norm("K7M X9Q P3A").unwrap(), "k7mx9qp3a");
         assert_eq!(norm("o1l-000-111").unwrap(), "011000111");
         assert!(norm("k7m-x9q").is_err() && norm("k7m-x9q-p3u").is_err());
-        for b in [keys("x", "k7m-x9q-p3a", 2).unwrap(), keys("y", "k7m-x9q-p3a", 1).unwrap()] {
-            assert!(a.0.public() != b.0.public() && a.1 != b.1);
+        let a = meet("x", "k7m", 1).public();
+        assert_eq!(a, meet("x", "k7m", 1).public());
+        for b in [meet("x", "k7n", 1), meet("x", "k7m", 2), meet("y", "k7m", 1)] {
+            assert!(a != b.public());
         }
+    }
+
+    /// draft-irtf-cfrg-cpace-21, appendix B.3: CPACE-RISTR255-SHA512.
+    #[test]
+    fn cpace_matches_the_drafts_vectors() {
+        let ci: &[u8] = b"\x0bA_initiator\x0bB_responder";
+        let sid = hex("7e4b4791d6a8ef019b936c79fb7f2c57");
+        let g = generator(b"Password", ci, &sid);
+        let g_hex = "222b6b195fe84b1652badb6f6a3ae3d24341e7306967f0b8115b40d5698c7e56";
+        assert_eq!(g.compress().to_bytes().to_vec(), hex(g_hex));
+        let ya = scalar("da3d23700a9e5699258aef94dc060dfda5ebb61f02a5ea77fad53f4ff0976d08");
+        let yb = scalar("d2316b454718c35362d83d69df6320f38578ed5984651435e2949762d900b80d");
+        let (pa, pb) = ((g * ya).compress().to_bytes(), (g * yb).compress().to_bytes());
+        let pa_hex = "d6bac480f2c386c394efc7c47adb9925dcd2630b64f240c50f8d0eec482b9157";
+        let pb_hex = "3ea7e0b19560d7c0b0f5734f63b955286dfa8232b5ebe63324e2d9e7433f7258";
+        assert_eq!((pa.to_vec(), pb.to_vec()), (hex(pa_hex), hex(pb_hex)));
+        let t = lv(&[&pa, b"ADa", &pb, b"ADb"]);
+        let want = hex(concat!(
+            "b69effbf61b51d56401c0f65601abe428de8206feaaf0e32198896dcae7b35cd",
+            "2b38950a39dfd5d4a79164614c2984f7daa460b588c1e80c3fa2068af7900447"
+        ));
+        assert_eq!(isk(&ya, &pb, &sid, &t).unwrap().to_vec(), want);
+        assert_eq!(isk(&yb, &pa, &sid, &t).unwrap().to_vec(), want);
+        // B.3.11: a share that fails to decode, and the identity, abort.
+        let s = scalar("7cd0e075fa7955ba52c02759a6c90dbbfc10e6d40aea8d283e407d88cf538a05");
+        let bad = hex("2b3c6b8c4f3800e7aef6864025b4ed79bd599117e427c41bd47d93d654b4a51c");
+        assert!(isk(&s, &bad, &sid, &t).is_none() && isk(&s, &[0; 32], &sid, &t).is_none());
     }
 
     /// Given on one device, taken on another over a relay; then spent.
@@ -368,25 +491,34 @@ mod tests {
         assert!(seal_qr("test", &[0; QR_SECRET + 1], &pw).await.is_err());
     }
 
-    /// A wrong proof, even to the right identity, gets nothing and burns it.
+    /// Anyone may reach the giver by its public nameplate, but one wrong
+    /// guess at the rest of the code gets nothing and burns it.
     #[tokio::test(flavor = "multi_thread")]
-    async fn one_wrong_proof_burns_a_code() {
+    async fn one_wrong_guess_burns_a_code() {
         let (_s, r) = relay().await;
         let (code, m) = loop {
             let m = minute();
             let code = give(ep(&r), "test", b"x", None).await.unwrap();
             if minute() == m {
-                break (code, m);
+                break (norm(&code).unwrap(), m);
             }
         };
-        let (sk, _) = keys("test", &code, m).unwrap();
         let e = ep(&r).bind().await.unwrap();
-        let at = EndpointAddr::from_parts(sk.public(), [TransportAddr::Relay(r.clone())]);
+        let at = EndpointAddr::from_parts(
+            meet("test", &code[..PLATE], m).public(),
+            [TransportAddr::Relay(r.clone())],
+        );
         let c = e.connect(at, ALPN).await.unwrap();
+        let guess = if &code[PLATE..] == "000000" { "000001" } else { "000000" };
+        let (g, sid) = cpace(&c, "test", guess).unwrap();
+        let (y, ya) = share(g, &mut hedged(b""));
+        let ek = [0u8; EK];
         let (mut tx, mut rx) = c.open_bi().await.unwrap();
-        let dk: DecapsulationKey = rand::<32>().into();
-        let pk = dk.encapsulation_key().to_bytes();
-        tx.write_all(&[&[0u8; 32][..], &pk].concat()).await.unwrap();
+        tx.write_all(&[&ya[..], &ek].concat()).await.unwrap();
+        let mut yb = [0u8; 32];
+        rx.read_exact(&mut yb).await.unwrap();
+        let isk = isk(&y, &yb, &sid, &lv(&[&ya, &ek, &yb, b""])).unwrap();
+        tx.write_all(&proof(&*isk)).await.unwrap();
         tx.finish().unwrap();
         assert!(rest(&mut rx, MAX).await.unwrap_or_default().is_empty());
         assert!(

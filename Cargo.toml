@@ -4,13 +4,14 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 license = "GPL-3.0-or-later"
-description = "Hand a secret to another device with a short code: one minute, one try, post-quantum"
+description = "Hand a secret to another device with a short code: CPace, one try, one minute, sealed post-quantum"
 repository = "https://github.com/cab-ucf/irpair"
 
 [dependencies]
 anyhow = "1"
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 chacha20poly1305 = "0.11"
+curve25519-dalek = { version = "5", default-features = false, features = ["zeroize"] }
 data-encoding = "2"
 getrandom = "0.4"
 rand_chacha = { version = "0.10", default-features = false }
