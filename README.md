@@ -37,7 +37,7 @@ Layers, each enough alone against a recording:
   secret (giver) or the code (taker). A rigged RNG on the giver predicts
   nothing; on the taker, whose only secret is the code, only the password
   layer holds.
-- A QR code has only the password layer: use `password()` (100 bits).
+- A QR code has only the password layer: use `password()` (99 bits).
 - Clocks over a minute apart cannot meet. ML-KEM and X-Wing are RustCrypto's,
   not yet independently audited.
 

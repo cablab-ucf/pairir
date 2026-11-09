@@ -18,7 +18,7 @@ use rand_chacha::{
 };
 use sha2::{Digest, Sha256, Sha512};
 use std::{sync::Mutex, time::Duration};
-use tokio::{io::AsyncReadExt, task::JoinSet, time::timeout};
+use tokio::{task::JoinSet, time::timeout};
 use x_wing::kem::Ciphertext;
 use x_wing::{Decapsulate, DecapsulationKey, Decapsulator, Encapsulate, EncapsulationKey};
 use x_wing::{KeyExport, XWingKem};
@@ -48,10 +48,9 @@ fn same(a: &[u8], b: &[u8]) -> bool {
 
 /// OS randomness hashed with a secret (RFC 8937): a rigged RNG alone
 /// predicts nothing the secret does not.
-fn hedged(secret: &[u8]) -> ChaCha20Rng {
-    ChaCha20Rng::from_seed(
-        Sha256::new().chain_update(rand::<32>()).chain_update(secret).finalize().into(),
-    )
+fn hedged(secrets: &[&[u8]]) -> ChaCha20Rng {
+    let h = Sha256::new().chain_update(rand::<32>());
+    ChaCha20Rng::from_seed(secrets.iter().fold(h, |h, s| h.chain_update(s)).finalize().into())
 }
 
 fn seal(key: &[u8; 32], msg: &[u8], rng: &mut ChaCha20Rng) -> Vec<u8> {
@@ -189,18 +188,11 @@ fn key(isk: &[u8], ss: &[u8]) -> Zeroizing<[u8; 32]> {
     Zeroizing::new(Sha256::digest(lv(&[b"irpair 2 key", isk, ss])).into())
 }
 
-async fn rest(rx: &mut iroh::endpoint::RecvStream, max: usize) -> Result<Vec<u8>> {
-    let mut b = Vec::new();
-    rx.take(max as u64 + 1).read_to_end(&mut b).await?;
-    ensure!(b.len() <= max, "over {max} bytes");
-    Ok(b)
-}
-
 /// A short code for `secret`, answered for `TTL`. Pass a password for
 /// anything that opens other secrets.
 pub async fn give(ep: Builder, app: &str, secret: &[u8], password: Option<&str>) -> Result<String> {
     ensure!(secret.len() <= SECRET, "over {SECRET} bytes: too long to hand over");
-    let mut rng = hedged(&[secret, password.unwrap_or("").as_bytes()].concat());
+    let mut rng = hedged(&[secret, password.unwrap_or("").as_bytes()]);
     let mut c = [0u8; LEN];
     rng.fill_bytes(&mut c);
     let c: String = c.iter().map(|b| ABC[*b as usize % 32] as char).collect();
@@ -216,7 +208,10 @@ pub async fn give(ep: Builder, app: &str, secret: &[u8], password: Option<&str>)
     });
     let ep = ep.secret_key(meet(app, &c[..PLATE], minute())).alpns(vec![ALPN.to_vec()]);
     let ep = ep.bind().await?;
-    let _ = timeout(Duration::from_secs(10), ep.online()).await;
+    if timeout(Duration::from_secs(10), ep.online()).await.is_err() {
+        ep.close().await;
+        bail!("no relay answers: nobody could reach a code");
+    }
     let (app, pw) = (app.to_string(), Zeroizing::new(c[PLATE..].to_string()));
     tokio::spawn(async move {
         // One try: right or wrong, the code is spent.
@@ -274,12 +269,13 @@ pub async fn take(
         return unlock(app, code, b, password).await;
     }
     let (plate, pw) = code.split_at(PLATE);
-    let mut rng = hedged(code.as_bytes());
+    let mut rng = hedged(&[code.as_bytes()]);
     let mut seed = Zeroizing::new([0u8; 32]);
     rng.fill_bytes(&mut *seed);
     let dk: DecapsulationKey = (*seed).into();
     let ek = dk.encapsulation_key().to_bytes();
-    let ep = ep.bind().await?;
+    // A fresh key: the taker is nobody the giver or the relay knows.
+    let ep = ep.secret_key(SecretKey::from_bytes(&rand())).bind().await?;
     let go = async {
         // This minute's rendezvous or a neighbour's (clock skew).
         let m = minute();
@@ -307,17 +303,19 @@ pub async fn take(
         let isk = isk(&y, &yb, &sid, &lv(&[&ya, &ek, &yb, b""])).context("not a code's answer")?;
         tx.write_all(&proof(&*isk)).await?;
         tx.finish()?;
-        let b = rest(&mut rx, MAX).await.unwrap_or_default();
-        let body = kem_open(&dk, &*isk, &b).context("that code was used or is wrong")?;
-        match Zeroizing::new(body).split_first() {
-            Some((0, s)) => Ok(Zeroizing::new(s.to_vec())),
-            Some((1, s)) => unlock(app, code.clone(), s.to_vec(), password).await,
-            _ => bail!("not a code's secret"),
-        }
+        let b = rx.read_to_end(MAX).await.unwrap_or_default();
+        kem_open(&dk, &*isk, &b).context("that code was used or is wrong")
     };
     let r = timeout(Duration::from_secs(30), go).await;
     ep.close().await;
-    r.unwrap_or_else(|_| bail!("nobody answers that code: wrong, or past its minute"))
+    let body = r.unwrap_or_else(|_| bail!("nobody answers that code: wrong, or past its minute"));
+    // Past the deadline above: the code is spent, so a slow Argon2 must not
+    // lose its secret.
+    match Zeroizing::new(body?).split_first() {
+        Some((0, s)) => Ok(Zeroizing::new(s.to_vec())),
+        Some((1, s)) => unlock(app, code, s.to_vec(), password).await,
+        _ => bail!("not a code's secret"),
+    }
 }
 
 fn kem_open(dk: &DecapsulationKey, isk: &[u8], b: &[u8]) -> Option<Vec<u8>> {
@@ -343,11 +341,14 @@ async fn unlock(
     bail!(if password.is_some() { "wrong password" } else { "that code has a password" })
 }
 
-/// 100 random bits: `k7m2-x9qp-...`.
+/// 99 random bits: `k7m2-x9qp-...`.
 pub fn password() -> String {
     let abc = b"23456789abcdefghjkmnpqrstuvwxyz";
-    let c: Vec<char> = rand::<20>().iter().map(|b| abc[*b as usize % 31] as char).collect();
-    c.chunks(4).map(|g| g.iter().collect::<String>()).collect::<Vec<_>>().join("-")
+    // Bytes under 248 = 8 * 31 alone: no letter likelier than another.
+    let mut c = std::iter::repeat_with(|| rand::<1>()[0])
+        .filter(|b| *b < 248)
+        .map(|b| abc[b as usize % 31] as char);
+    (0..5).map(|_| c.by_ref().take(4).collect()).collect::<Vec<String>>().join("-")
 }
 
 const QR: &str = "IRPAIR1:";
@@ -357,7 +358,7 @@ pub const QR_SECRET: usize = 2 << 10;
 /// 256 MiB, XChaCha20-Poly1305), so make it [`password`].
 pub async fn seal_qr(app: &str, secret: &[u8], password: &str) -> Result<String> {
     ensure!(secret.len() <= QR_SECRET, "over {QR_SECRET} bytes: too long for a QR code");
-    let mut rng = hedged(&[secret, password.as_bytes()].concat());
+    let mut rng = hedged(&[secret, password.as_bytes()]);
     let mut salt = [0u8; 16];
     rng.fill_bytes(&mut salt);
     let ct = seal(&*locked("irpair qr 1 ", app, password, salt).await?, secret, &mut rng);
@@ -511,7 +512,7 @@ mod tests {
         let c = e.connect(at, ALPN).await.unwrap();
         let guess = if &code[PLATE..] == "000000" { "000001" } else { "000000" };
         let (g, sid) = cpace(&c, "test", guess).unwrap();
-        let (y, ya) = share(g, &mut hedged(b""));
+        let (y, ya) = share(g, &mut hedged(&[]));
         let ek = [0u8; EK];
         let (mut tx, mut rx) = c.open_bi().await.unwrap();
         tx.write_all(&[&ya[..], &ek].concat()).await.unwrap();
@@ -520,7 +521,7 @@ mod tests {
         let isk = isk(&y, &yb, &sid, &lv(&[&ya, &ek, &yb, b""])).unwrap();
         tx.write_all(&proof(&*isk)).await.unwrap();
         tx.finish().unwrap();
-        assert!(rest(&mut rx, MAX).await.unwrap_or_default().is_empty());
+        assert!(rx.read_to_end(MAX).await.unwrap_or_default().is_empty());
         assert!(
             take(ep(&r), std::slice::from_ref(&r), "test", &code, None).await.is_err(),
             "burnt"
