@@ -64,8 +64,8 @@ class ScanActivity : ComponentActivity() {
     }
     private val work = Executors.newSingleThreadExecutor()
 
-    override fun onCreate(state: Bundle?) {
-        super.onCreate(state)
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         val view = PreviewView(this)
         setContentView(view)
