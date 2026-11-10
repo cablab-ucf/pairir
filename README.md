@@ -4,8 +4,8 @@ Hand a secret to another device with a code said aloud (`k7m-x9q-p3a-b2c`,
 one minute, one try), or offline with a QR code.
 
 ```rust
-let (code, end) = pairir::give(irnet::endpoint(), "app", secret, Some(&pw)).await?;
-let secret = pairir::take(irnet::endpoint(), &irnet::relays(), "app", &code, Some(&pw)).await?;
+let (code, end) = pairir::give(&[], "app", secret, Some(&pw)).await?;   // &[]: the lab's relays
+let secret = pairir::take(&[], "app", &code, Some(&pw)).await?;
 let text = pairir::seal_qr("app", secret, &pw).await?;     // QR code, no network
 let secret = pairir::open_qr("app", &text, &pw).await?;
 ```
@@ -21,7 +21,7 @@ Layers, each enough alone against a recording:
 
 | Layer | Breaks only if |
 |---|---|
-| iroh TLS 1.3, X25519MLKEM768 | TLS falls |
+| irnet's endpoint: TLS 1.3 with X25519MLKEM768, or the handshake is refused | TLS falls |
 | sealed to the taker's fresh X-Wing key, under a key from X-Wing and CPace together | ML-KEM and X25519 both fall, and CPace too |
 | under the password: Argon2id 256 MiB, 4 passes | the password is guessed |
 

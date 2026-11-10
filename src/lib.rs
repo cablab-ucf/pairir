@@ -15,7 +15,7 @@ use chacha20poly1305::{
 };
 use curve25519_dalek::traits::IsIdentity;
 use curve25519_dalek::{RistrettoPoint, Scalar, ristretto::CompressedRistretto};
-use iroh::endpoint::{Builder, Connection};
+use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, RelayUrl, SecretKey, TransportAddr};
 use sha2::{Digest, Sha256, Sha512};
 use std::sync::Mutex;
@@ -201,10 +201,11 @@ pub enum End {
     Expired,
 }
 
-/// A short code for `secret`, answered for `TTL`, and how it ends. Pass a
+/// A short code for `secret`, answered for `TTL` on `relays` (none: the
+/// lab's) from an irnet endpoint, and how it ends. Pass a
 /// password for anything that opens other secrets.
 pub async fn give(
-    ep: Builder,
+    relays: &[RelayUrl],
     app: &str,
     secret: &[u8],
     password: Option<&str>,
@@ -224,7 +225,8 @@ pub async fn give(
             [&[1][..], &salt, &seal(&k, secret, &mut rng)].concat()
         }
     });
-    let ep = ep.secret_key(meet(app, &c[..PLATE], minute())).alpns(vec![ALPN.to_vec()]);
+    let ep = irnet::on(relays).secret_key(meet(app, &c[..PLATE], minute()));
+    let ep = ep.alpns(vec![ALPN.to_vec()]);
     let ep = ep.bind().await?;
     if timeout(Duration::from_secs(10), ep.online()).await.is_err() {
         ep.close().await;
@@ -281,7 +283,6 @@ const HOLD: Duration = Duration::from_secs(600);
 
 /// The secret a short code stands for, from its giver on `relays`.
 pub async fn take(
-    ep: Builder,
     relays: &[RelayUrl],
     app: &str,
     code: &str,
@@ -300,7 +301,9 @@ pub async fn take(
     let dk: DecapsulationKey = (*seed).into();
     let ek = dk.encapsulation_key().to_bytes();
     // A fresh key: the taker is nobody the giver or the relay knows.
-    let ep = ep.secret_key(SecretKey::from_bytes(&rand())).bind().await?;
+    let ep = irnet::on(relays).secret_key(SecretKey::from_bytes(&rand())).bind().await?;
+    let lab = irnet::relays();
+    let relays = if relays.is_empty() { &lab[..] } else { relays };
     let go = async {
         // This minute's rendezvous or a neighbour's (clock skew).
         let m = minute();
@@ -406,7 +409,6 @@ pub async fn open_qr(app: &str, text: &str, password: &str) -> Result<Zeroizing<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iroh::{RelayMode, endpoint::presets};
     use iroh_relay::server::{RelayConfig, Server, ServerConfig};
 
     async fn relay() -> (Server, RelayUrl) {
@@ -415,10 +417,6 @@ mod tests {
         let s = Server::spawn(cfg).await.unwrap();
         let url = format!("http://{}/", s.http_addr().unwrap()).parse().unwrap();
         (s, url)
-    }
-
-    fn ep(r: &RelayUrl) -> Builder {
-        iroh::Endpoint::builder(presets::Minimal).relay_mode(RelayMode::custom([r.clone()]))
     }
 
     fn hex(s: &str) -> Vec<u8> {
@@ -472,27 +470,25 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_short_code_hands_over_its_secret_once() {
         let (_s, r) = relay().await;
-        let (code, end) = give(ep(&r), "test", b"invite", None).await.unwrap();
+        let (code, end) = give(std::slice::from_ref(&r), "test", b"invite", None).await.unwrap();
         assert_eq!(code.len(), 15, "xxx-xxx-xxx-xxx");
-        let got = take(ep(&r), std::slice::from_ref(&r), "test", &code.to_uppercase(), None).await;
+        let got = take(std::slice::from_ref(&r), "test", &code.to_uppercase(), None).await;
         assert_eq!(*got.unwrap(), b"invite");
         assert_eq!(end.await.unwrap(), End::Taken);
-        assert!(
-            take(ep(&r), std::slice::from_ref(&r), "test", &code, None).await.is_err(),
-            "spent"
-        );
+        assert!(take(std::slice::from_ref(&r), "test", &code, None).await.is_err(), "spent");
         // Another app's code never opens here.
-        let (code, _) = give(ep(&r), "test", b"invite", None).await.unwrap();
-        assert!(take(ep(&r), std::slice::from_ref(&r), "other", &code, None).await.is_err());
+        let (code, _) = give(std::slice::from_ref(&r), "test", b"invite", None).await.unwrap();
+        assert!(take(std::slice::from_ref(&r), "other", &code, None).await.is_err());
     }
 
     /// With a password: the taker needs it too, and may give it after.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_password_locks_it_once_more() {
         let (_s, r) = relay().await;
-        let (code, _) = give(ep(&r), "test", b"seed", Some("horse battery")).await.unwrap();
+        let (code, _) =
+            give(std::slice::from_ref(&r), "test", b"seed", Some("horse battery")).await.unwrap();
         let rs = [r.clone()];
-        let t = |p| take(ep(&r), &rs, "test", &code, p);
+        let t = |p| take(&rs, "test", &code, p);
         assert!(t(None).await.unwrap_err().to_string().contains("has a password"));
         assert!(t(Some("wrong")).await.unwrap_err().to_string().contains("wrong password"));
         assert_eq!(*t(Some("horse battery")).await.unwrap(), b"seed");
@@ -504,9 +500,9 @@ mod tests {
     async fn the_largest_secret_fits() {
         let (_s, r) = relay().await;
         let big = vec![7u8; SECRET];
-        assert!(give(ep(&r), "test", &[0; SECRET + 1], None).await.is_err());
-        let (code, _) = give(ep(&r), "test", &big, Some("pw")).await.unwrap();
-        let got = take(ep(&r), std::slice::from_ref(&r), "test", &code, Some("pw")).await;
+        assert!(give(std::slice::from_ref(&r), "test", &[0; SECRET + 1], None).await.is_err());
+        let (code, _) = give(std::slice::from_ref(&r), "test", &big, Some("pw")).await.unwrap();
+        let got = take(std::slice::from_ref(&r), "test", &code, Some("pw")).await;
         assert_eq!(*got.unwrap(), big);
     }
 
@@ -530,12 +526,12 @@ mod tests {
         let (_s, r) = relay().await;
         let (code, end, m) = loop {
             let m = minute();
-            let (code, end) = give(ep(&r), "test", b"x", None).await.unwrap();
+            let (code, end) = give(std::slice::from_ref(&r), "test", b"x", None).await.unwrap();
             if minute() == m {
                 break (norm(&code).unwrap(), end, m);
             }
         };
-        let e = ep(&r).bind().await.unwrap();
+        let e = irnet::on(std::slice::from_ref(&r)).bind().await.unwrap();
         let at = EndpointAddr::from_parts(
             meet("test", &code[..PLATE], m).public(),
             [TransportAddr::Relay(r.clone())],
@@ -554,9 +550,6 @@ mod tests {
         tx.finish().unwrap();
         assert!(rx.read_to_end(MAX).await.unwrap_or_default().is_empty());
         assert_eq!(end.await.unwrap(), End::Spent);
-        assert!(
-            take(ep(&r), std::slice::from_ref(&r), "test", &code, None).await.is_err(),
-            "burnt"
-        );
+        assert!(take(std::slice::from_ref(&r), "test", &code, None).await.is_err(), "burnt");
     }
 }
