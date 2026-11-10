@@ -1,4 +1,4 @@
-// Standalone build (CI); apps include :irpair with their own plugin versions.
+// Standalone build (CI); apps include :pairir with their own plugin versions.
 // AGP's built-in Kotlin, at the latest compiler.
 buildscript { dependencies { classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.4.21") } }
 

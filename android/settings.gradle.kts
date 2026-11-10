@@ -4,5 +4,5 @@ pluginManagement {
 dependencyResolutionManagement {
     repositories { google(); mavenCentral() }
 }
-rootProject.name = "irpair-android"
-include(":irpair")
+rootProject.name = "pairir-android"
+include(":pairir")

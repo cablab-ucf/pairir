@@ -7,7 +7,7 @@
 
     <application>
         <activity
-            android:name="org.irpair.ScanActivity"
+            android:name="org.pairir.ScanActivity"
             android:exported="false"
             android:theme="@android:style/Theme.Material.NoActionBar" />
     </application>

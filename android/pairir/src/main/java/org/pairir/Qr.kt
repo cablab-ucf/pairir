@@ -1,4 +1,4 @@
-package org.irpair
+package org.pairir
 
 import android.Manifest
 import android.app.Activity
@@ -28,11 +28,11 @@ import com.google.zxing.common.HybridBinarizer
 import com.google.zxing.qrcode.QRCodeWriter
 import java.util.concurrent.Executors
 
-/** irpair's QR codes: what they carry is sealed by the irpair crate
+/** pairir's QR codes: what they carry is sealed by the pairir crate
  *  (`seal_qr`) under a password, so a code seen by anything else gives
  *  nothing away. */
 object Qr {
-    internal const val PREFIX = "IRPAIR1:"
+    internal const val PREFIX = "PAIRIR1:"
 
     /** The code for [text], [size] pixels square. */
     fun bitmap(text: String, size: Int): Bitmap {
@@ -43,7 +43,7 @@ object Qr {
     }
 }
 
-/** Scan an irpair QR code with the camera: its text, or null. */
+/** Scan an pairir QR code with the camera: its text, or null. */
 class ScanQr : ActivityResultContract<Unit, String?>() {
     override fun createIntent(context: Context, input: Unit) =
         Intent(context, ScanActivity::class.java)
@@ -56,7 +56,7 @@ class ScanQr : ActivityResultContract<Unit, String?>() {
     }
 }
 
-/** The camera until an irpair code is in view: frames are read in memory,
+/** The camera until an pairir code is in view: frames are read in memory,
  *  none kept, nothing sent, and the screen cannot be captured. */
 class ScanActivity : ComponentActivity() {
     private val reader = MultiFormatReader().apply {

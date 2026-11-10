@@ -35,4 +35,4 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - run: gh release create "$TAG" --target "$GITHUB_SHA" --title "irpair $TAG" --generate-notes
+      - run: gh release create "$TAG" --target "$GITHUB_SHA" --title "pairir $TAG" --generate-notes
