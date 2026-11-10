@@ -1,11 +1,11 @@
-// Showing and scanning irpair QR codes, in Kotlin; what they carry is
-// sealed by the irpair crate (`seal_qr`) in the app's native library.
+// Showing and scanning pairir QR codes, in Kotlin; what they carry is
+// sealed by the pairir crate (`seal_qr`) in the app's native library.
 plugins {
     id("com.android.library") // AGP 9: Kotlin is built in
 }
 
 android {
-    namespace = "org.irpair"
+    namespace = "org.pairir"
     compileSdk = 37
     defaultConfig { minSdk = 26 }
     compileOptions {

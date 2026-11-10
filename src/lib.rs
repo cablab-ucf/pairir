@@ -1,5 +1,6 @@
-//! Hand a secret to another device with a code said aloud (`k7m-x9q-p3a`,
-//! one minute, one try) or an offline QR code. See README.md.
+//! Hand a secret to another device with a code said aloud
+//! (`k7m-x9q-p3a-b2c`, one minute, one try) or an offline QR code. See
+//! README.md.
 
 #![forbid(unsafe_code)]
 
@@ -27,11 +28,12 @@ use zeroize::Zeroizing;
 
 /// How long a code is answered.
 pub const TTL: Duration = Duration::from_secs(60);
-const ALPN: &[u8] = b"irpair/2";
+const ALPN: &[u8] = b"pairir/3";
 const ABC: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
-const LEN: usize = 9;
-/// The code's first group, its nameplate: public, it only finds the giver.
-const PLATE: usize = 3;
+const LEN: usize = 12;
+/// The code's first half, its nameplate: public, it only finds the giver.
+/// 30 bits: too many rendezvous to dial them all within a code's minute.
+const PLATE: usize = 6;
 const EK: usize = 1216;
 const KEM_CT: usize = 1120;
 const MAX: usize = 1 << 16;
@@ -131,7 +133,7 @@ fn lv(parts: &[&[u8]]) -> Vec<u8> {
 /// it, so TLS hides the handoff but proves nothing; CPace does.
 fn meet(app: &str, plate: &str, m: u64) -> SecretKey {
     let h =
-        Sha256::digest(lv(&[b"irpair 2 meet", app.as_bytes(), &m.to_le_bytes(), plate.as_bytes()]));
+        Sha256::digest(lv(&[b"pairir 3 meet", app.as_bytes(), &m.to_le_bytes(), plate.as_bytes()]));
     SecretKey::from_bytes(&h.into())
 }
 
@@ -174,36 +176,51 @@ fn isk(y: &Scalar, theirs: &[u8], sid: &[u8], transcript: &[u8]) -> Option<Zeroi
 /// The CPace generator and sid both ends derive, bound to `c`.
 fn cpace(c: &Connection, app: &str, pw: &str) -> Result<(RistrettoPoint, [u8; 32])> {
     let mut sid = [0; 32];
-    c.export_keying_material(&mut sid, b"EXPORTER-irpair-cpace", b"")
+    c.export_keying_material(&mut sid, b"EXPORTER-pairir-cpace", b"")
         .map_err(|e| anyhow!("tls exporter: {e:?}"))?;
-    Ok((generator(pw.as_bytes(), &lv(&[b"irpair 2", app.as_bytes()]), &sid), sid))
+    Ok((generator(pw.as_bytes(), &lv(&[b"pairir 3", app.as_bytes()]), &sid), sid))
 }
 
 /// The taker's proof that it holds the code, before the giver answers.
 fn proof(isk: &[u8]) -> [u8; 32] {
-    Sha256::digest(lv(&[b"irpair 2 taker", isk])).into()
+    Sha256::digest(lv(&[b"pairir 3 taker", isk])).into()
 }
 
 /// The answer's key: CPace and X-Wing together, so it holds while either does.
 fn key(isk: &[u8], ss: &[u8]) -> Zeroizing<[u8; 32]> {
-    Zeroizing::new(Sha256::digest(lv(&[b"irpair 2 key", isk, ss])).into())
+    Zeroizing::new(Sha256::digest(lv(&[b"pairir 3 key", isk, ss])).into())
 }
 
-/// A short code for `secret`, answered for `TTL`. Pass a password for
-/// anything that opens other secrets.
-pub async fn give(ep: Builder, app: &str, secret: &[u8], password: Option<&str>) -> Result<String> {
+/// How a code ended: handed to a taker who proved it; spent by someone who
+/// reached it and did not (a wrong code, a broken exchange: tell the user);
+/// or never reached.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum End {
+    Taken,
+    Spent,
+    Expired,
+}
+
+/// A short code for `secret`, answered for `TTL`, and how it ends. Pass a
+/// password for anything that opens other secrets.
+pub async fn give(
+    ep: Builder,
+    app: &str,
+    secret: &[u8],
+    password: Option<&str>,
+) -> Result<(String, tokio::task::JoinHandle<End>)> {
     ensure!(secret.len() <= SECRET, "over {SECRET} bytes: too long to hand over");
     let mut rng = hedged(&[secret, password.unwrap_or("").as_bytes()]);
     let mut c = [0u8; LEN];
     rng.fill_bytes(&mut c);
     let c: String = c.iter().map(|b| ABC[*b as usize % 32] as char).collect();
-    let code = format!("{}-{}-{}", &c[..3], &c[3..6], &c[6..]);
+    let code = format!("{}-{}-{}-{}", &c[..3], &c[3..6], &c[6..9], &c[9..]);
     let body = Zeroizing::new(match password {
         None => [&[0][..], secret].concat(),
         Some(p) => {
             let mut salt = [0u8; 16];
             rng.fill_bytes(&mut salt);
-            let k = locked("irpair 2 ", app, p, salt).await?;
+            let k = locked("pairir 3 ", app, p, salt).await?;
             [&[1][..], &salt, &seal(&k, secret, &mut rng)].concat()
         }
     });
@@ -214,12 +231,17 @@ pub async fn give(ep: Builder, app: &str, secret: &[u8], password: Option<&str>)
         bail!("no relay answers: nobody could reach a code");
     }
     let (app, pw) = (app.to_string(), Zeroizing::new(c[PLATE..].to_string()));
-    tokio::spawn(async move {
+    let end = tokio::spawn(async move {
         // One try: right or wrong, the code is spent.
-        let _ = timeout(TTL, answer(&ep, &app, &pw, &body, &mut rng)).await;
+        let end = match timeout(TTL, answer(&ep, &app, &pw, &body, &mut rng)).await {
+            Ok(Some(())) => End::Taken,
+            Ok(None) => End::Spent,
+            Err(_) => End::Expired,
+        };
         ep.close().await;
+        end
     });
-    Ok(code)
+    Ok((code, end))
 }
 
 async fn answer(
@@ -336,7 +358,7 @@ async fn unlock(
 ) -> Result<Zeroizing<Vec<u8>>> {
     if let Some(p) = password
         && let Some((salt, ct)) = b.split_at_checked(16)
-        && let Some(s) = open(&*locked("irpair 2 ", app, p, salt.try_into()?).await?, ct)
+        && let Some(s) = open(&*locked("pairir 3 ", app, p, salt.try_into()?).await?, ct)
     {
         return Ok(Zeroizing::new(s));
     }
@@ -359,7 +381,7 @@ pub fn password() -> String {
     (0..5).map(|_| c.by_ref().take(4).collect()).collect::<Vec<String>>().join("-")
 }
 
-const QR: &str = "IRPAIR1:";
+const QR: &str = "PAIRIR1:";
 pub const QR_SECRET: usize = 2 << 10;
 
 /// An offline QR code's text: `secret` under `password` alone (Argon2id
@@ -369,15 +391,15 @@ pub async fn seal_qr(app: &str, secret: &[u8], password: &str) -> Result<String>
     let mut rng = hedged(&[secret, password.as_bytes()]);
     let mut salt = [0u8; 16];
     rng.fill_bytes(&mut salt);
-    let ct = seal(&*locked("irpair qr 1 ", app, password, salt).await?, secret, &mut rng);
+    let ct = seal(&*locked("pairir qr 1 ", app, password, salt).await?, secret, &mut rng);
     Ok(format!("{QR}{}", data_encoding::BASE32_NOPAD.encode(&[&salt[..], &ct].concat())))
 }
 
 pub async fn open_qr(app: &str, text: &str, password: &str) -> Result<Zeroizing<Vec<u8>>> {
-    let body = text.trim().strip_prefix(QR).context("not an irpair QR code")?;
-    let b = data_encoding::BASE32_NOPAD.decode(body.as_bytes()).context("not an irpair QR code")?;
-    let (salt, ct) = b.split_at_checked(16).context("not an irpair QR code")?;
-    let k = locked("irpair qr 1 ", app, password, salt.try_into()?).await?;
+    let body = text.trim().strip_prefix(QR).context("not an pairir QR code")?;
+    let b = data_encoding::BASE32_NOPAD.decode(body.as_bytes()).context("not an pairir QR code")?;
+    let (salt, ct) = b.split_at_checked(16).context("not an pairir QR code")?;
+    let k = locked("pairir qr 1 ", app, password, salt.try_into()?).await?;
     open(&k, ct).map(Zeroizing::new).context("wrong password, or another app's code")
 }
 
@@ -409,12 +431,12 @@ mod tests {
 
     #[test]
     fn codes_read_as_typed_and_meet_by_nameplate_minute_and_app() {
-        assert_eq!(norm("K7M X9Q P3A").unwrap(), "k7mx9qp3a");
-        assert_eq!(norm("o1l-000-111").unwrap(), "011000111");
-        assert!(norm("k7m-x9q").is_err() && norm("k7m-x9q-p3u").is_err());
-        let a = meet("x", "k7m", 1).public();
-        assert_eq!(a, meet("x", "k7m", 1).public());
-        for b in [meet("x", "k7n", 1), meet("x", "k7m", 2), meet("y", "k7m", 1)] {
+        assert_eq!(norm("K7M X9Q P3A B2C").unwrap(), "k7mx9qp3ab2c");
+        assert_eq!(norm("o1l-000-111-ilo").unwrap(), "011000111110");
+        assert!(norm("k7m-x9q-p3a").is_err() && norm("k7m-x9q-p3a-b2u").is_err());
+        let a = meet("x", "k7mx9q", 1).public();
+        assert_eq!(a, meet("x", "k7mx9q", 1).public());
+        for b in [meet("x", "k7mx9r", 1), meet("x", "k7mx9q", 2), meet("y", "k7mx9q", 1)] {
             assert!(a != b.public());
         }
     }
@@ -450,16 +472,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_short_code_hands_over_its_secret_once() {
         let (_s, r) = relay().await;
-        let code = give(ep(&r), "test", b"invite", None).await.unwrap();
-        assert_eq!(code.len(), 11, "xxx-xxx-xxx");
+        let (code, end) = give(ep(&r), "test", b"invite", None).await.unwrap();
+        assert_eq!(code.len(), 15, "xxx-xxx-xxx-xxx");
         let got = take(ep(&r), std::slice::from_ref(&r), "test", &code.to_uppercase(), None).await;
         assert_eq!(*got.unwrap(), b"invite");
+        assert_eq!(end.await.unwrap(), End::Taken);
         assert!(
             take(ep(&r), std::slice::from_ref(&r), "test", &code, None).await.is_err(),
             "spent"
         );
         // Another app's code never opens here.
-        let code = give(ep(&r), "test", b"invite", None).await.unwrap();
+        let (code, _) = give(ep(&r), "test", b"invite", None).await.unwrap();
         assert!(take(ep(&r), std::slice::from_ref(&r), "other", &code, None).await.is_err());
     }
 
@@ -467,7 +490,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_password_locks_it_once_more() {
         let (_s, r) = relay().await;
-        let code = give(ep(&r), "test", b"seed", Some("horse battery")).await.unwrap();
+        let (code, _) = give(ep(&r), "test", b"seed", Some("horse battery")).await.unwrap();
         let rs = [r.clone()];
         let t = |p| take(ep(&r), &rs, "test", &code, p);
         assert!(t(None).await.unwrap_err().to_string().contains("has a password"));
@@ -482,7 +505,7 @@ mod tests {
         let (_s, r) = relay().await;
         let big = vec![7u8; SECRET];
         assert!(give(ep(&r), "test", &[0; SECRET + 1], None).await.is_err());
-        let code = give(ep(&r), "test", &big, Some("pw")).await.unwrap();
+        let (code, _) = give(ep(&r), "test", &big, Some("pw")).await.unwrap();
         let got = take(ep(&r), std::slice::from_ref(&r), "test", &code, Some("pw")).await;
         assert_eq!(*got.unwrap(), big);
     }
@@ -505,11 +528,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn one_wrong_guess_burns_a_code() {
         let (_s, r) = relay().await;
-        let (code, m) = loop {
+        let (code, end, m) = loop {
             let m = minute();
-            let code = give(ep(&r), "test", b"x", None).await.unwrap();
+            let (code, end) = give(ep(&r), "test", b"x", None).await.unwrap();
             if minute() == m {
-                break (norm(&code).unwrap(), m);
+                break (norm(&code).unwrap(), end, m);
             }
         };
         let e = ep(&r).bind().await.unwrap();
@@ -530,6 +553,7 @@ mod tests {
         tx.write_all(&proof(&*isk)).await.unwrap();
         tx.finish().unwrap();
         assert!(rx.read_to_end(MAX).await.unwrap_or_default().is_empty());
+        assert_eq!(end.await.unwrap(), End::Spent);
         assert!(
             take(ep(&r), std::slice::from_ref(&r), "test", &code, None).await.is_err(),
             "burnt"
