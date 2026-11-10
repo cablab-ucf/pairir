@@ -4,6 +4,10 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use chacha20::{
+    ChaCha20Rng,
+    rand_core::{Rng, SeedableRng},
+};
 use chacha20poly1305::{
     KeyInit, XChaCha20Poly1305,
     aead::{Aead, Payload},
@@ -12,12 +16,9 @@ use curve25519_dalek::traits::IsIdentity;
 use curve25519_dalek::{RistrettoPoint, Scalar, ristretto::CompressedRistretto};
 use iroh::endpoint::{Builder, Connection};
 use iroh::{Endpoint, EndpointAddr, RelayUrl, SecretKey, TransportAddr};
-use rand_chacha::{
-    ChaCha20Rng,
-    rand_core::{Rng, SeedableRng},
-};
 use sha2::{Digest, Sha256, Sha512};
-use std::{sync::Mutex, time::Duration};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tokio::{task::JoinSet, time::timeout};
 use x_wing::kem::Ciphertext;
 use x_wing::{Decapsulate, DecapsulationKey, Decapsulator, Encapsulate, EncapsulationKey};
@@ -250,9 +251,11 @@ async fn answer(
     Some(())
 }
 
-/// The last locked secret taken, for a password given after its one try.
-type Held = (String, String, Vec<u8>);
+/// The last locked secret taken, for a password given within [`HOLD`] of
+/// its one try: then it is dropped.
+type Held = (String, String, Vec<u8>, Instant);
 static HELD: Mutex<Option<Held>> = Mutex::new(None);
+const HOLD: Duration = Duration::from_secs(600);
 
 /// The secret a short code stands for, from its giver on `relays`.
 pub async fn take(
@@ -265,7 +268,7 @@ pub async fn take(
     let code = norm(code)?;
     let held =
         HELD.lock().unwrap_or_else(|e| e.into_inner()).take_if(|h| h.0 == app && h.1 == code);
-    if let Some((_, code, b)) = held {
+    if let Some((_, code, b, _)) = held {
         return unlock(app, code, b, password).await;
     }
     let (plate, pw) = code.split_at(PLATE);
@@ -337,7 +340,12 @@ async fn unlock(
     {
         return Ok(Zeroizing::new(s));
     }
-    *HELD.lock().unwrap_or_else(|e| e.into_inner()) = Some((app.into(), code, b));
+    let at = Instant::now();
+    *HELD.lock().unwrap_or_else(|e| e.into_inner()) = Some((app.into(), code, b, at));
+    tokio::spawn(async move {
+        tokio::time::sleep(HOLD).await;
+        HELD.lock().unwrap_or_else(|e| e.into_inner()).take_if(|h| h.3 == at);
+    });
     bail!(if password.is_some() { "wrong password" } else { "that code has a password" })
 }
 
