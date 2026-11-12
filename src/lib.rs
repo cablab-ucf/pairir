@@ -228,7 +228,16 @@ pub async fn give(
     let ep = irnet::on(relays).secret_key(meet(app, &c[..PLATE], minute()));
     let ep = ep.alpns(vec![ALPN.to_vec()]);
     let ep = ep.bind().await?;
-    if timeout(Duration::from_secs(10), ep.online()).await.is_err() {
+    // The lab's: its first relay, the next once that has not answered for
+    // 10 s (the taker dials both).
+    let wait = match relays.is_empty() {
+        true => {
+            tokio::spawn(irnet::fallback(ep.clone()));
+            25
+        }
+        false => 10,
+    };
+    if timeout(Duration::from_secs(wait), ep.online()).await.is_err() {
         ep.close().await;
         bail!("no relay answers: nobody could reach a code");
     }
