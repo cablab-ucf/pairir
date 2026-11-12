@@ -44,6 +44,9 @@ Layers, each enough alone against a recording:
 - Clocks over a minute apart cannot meet. ML-KEM and X-Wing are RustCrypto's,
   not yet independently audited.
 
+- Relays: with none given, the giver homes on irpush.cxn.center, and on
+  iroh.cxn.center once that has not answered for 10 s; the taker dials both.
+
 `android/pairir`: `Qr.bitmap(text, size)` and `ScanQr` (CameraX + ZXing, no
 Play Services, under FLAG_SECURE).
 

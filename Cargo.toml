@@ -18,7 +18,7 @@ getrandom = "0.4"
 sha2 = "0.11"
 iroh = { version = "1.4", default-features = false }
 # The endpoint every pairing runs on: post-quantum TLS, or refused.
-irnet = { git = "https://github.com/cablab-ucf/irnet", rev = "7a19e4aeac4b56365626feea68cddd17496a18dc" }
+irnet = { git = "https://github.com/cablab-ucf/irnet", rev = "fbd691d1b6dd34d4d2c027b6875df3f11c918f66" }
 tokio = { version = "1", features = ["rt", "time"] }
 x-wing = { version = "0.1", features = ["zeroize"] }
 zeroize = "1"
