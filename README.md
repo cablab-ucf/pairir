@@ -50,4 +50,21 @@ Layers, each enough alone against a recording:
 `android/pairir`: `Qr.bitmap(text, size)` and `ScanQr` (CameraX + ZXing, no
 Play Services, under FLAG_SECURE).
 
+`web/`: the same codes in a browser, interoperable with the apps: pairir
+compiled to wasm (irnet's pure-Rust TLS: X25519MLKEM768 still, or refused),
+run in a Web Worker, behind a CSP that admits the page's own code and the
+lab's relays alone. `web/build.sh` makes `web/dist/` (and its SHA256SUMS)
+for any static host; `PAIRIR_RELAY=<url>` at build time homes it on a
+deployment's own relay (add it to the CSP). A browser reaches peers through
+a relay only. Argon2id takes ~2 s there.
+
+- A page is only as trusted as whoever serves it, on every visit: a host,
+  CDN or compromised account that changes the files reads every secret. The
+  apps are trusted once, at install. Serve it from a host you control, with
+  `_headers`' CSP (a `<meta>` CSP does not reach the worker), and publish
+  SHA256SUMS, or serve `dist/` from localhost (a module worker does not
+  run from file://).
+- JavaScript strings cannot be zeroized: the secret lingers in the tab
+  until it is collected. Close the tab after.
+
 License: GPL-3.0-or-later.

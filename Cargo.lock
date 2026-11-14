@@ -140,6 +140,7 @@ dependencies = [
  "blake2",
  "cpufeatures 0.3.1",
  "password-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -1476,6 +1477,7 @@ dependencies = [
  "hmac",
  "hpke",
  "iroh",
+ "ml-kem",
  "n0-future",
  "noq-proto",
  "rustls",
@@ -1903,6 +1905,7 @@ dependencies = [
  "hybrid-array",
  "kem",
  "module-lattice",
+ "pkcs8",
  "rand_core",
  "sha3",
  "shake",
@@ -2450,6 +2453,7 @@ dependencies = [
  "irnet",
  "iroh",
  "iroh-relay",
+ "n0-future",
  "sha2",
  "tokio",
  "x-wing",

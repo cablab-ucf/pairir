@@ -17,10 +17,10 @@ use curve25519_dalek::traits::IsIdentity;
 use curve25519_dalek::{RistrettoPoint, Scalar, ristretto::CompressedRistretto};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, RelayUrl, SecretKey, TransportAddr};
+use n0_future::task::{JoinHandle, JoinSet, spawn};
+use n0_future::time::{Duration, Instant, SystemTime, sleep, timeout};
 use sha2::{Digest, Sha256, Sha512};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
-use tokio::{task::JoinSet, time::timeout};
 use x_wing::kem::Ciphertext;
 use x_wing::{Decapsulate, DecapsulationKey, Decapsulator, Encapsulate, EncapsulationKey};
 use x_wing::{KeyExport, XWingKem};
@@ -86,7 +86,7 @@ fn norm(code: &str) -> Result<String> {
 }
 
 fn minute() -> u64 {
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    let t = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
     t.map_or(0, |d| d.as_secs() / 60)
 }
 
@@ -107,11 +107,15 @@ async fn locked(
     ensure!(!password.is_empty(), "empty password");
     let salt = [tag.as_bytes(), app.as_bytes(), b" ", &salt].concat();
     let p = Zeroizing::new(password.to_string());
-    tokio::task::spawn_blocking(move || {
+    let f = move || {
         let mut k = Zeroizing::new([0u8; 32]);
         argon(p.as_bytes(), &salt, &mut k[..], 256 << 10, 4).map(|_| k)
-    })
-    .await?
+    };
+    // A browser has no blocking pool: run pairir there in a Web Worker.
+    #[cfg(target_arch = "wasm32")]
+    return f();
+    #[cfg(not(target_arch = "wasm32"))]
+    tokio::task::spawn_blocking(f).await?
 }
 
 /// Length-value encoding (CPace's lv_cat): each part after its LEB128 length.
@@ -209,7 +213,7 @@ pub async fn give(
     app: &str,
     secret: &[u8],
     password: Option<&str>,
-) -> Result<(String, tokio::task::JoinHandle<End>)> {
+) -> Result<(String, JoinHandle<End>)> {
     ensure!(secret.len() <= SECRET, "over {SECRET} bytes: too long to hand over");
     let mut rng = hedged(&[secret, password.unwrap_or("").as_bytes()]);
     let mut c = [0u8; LEN];
@@ -232,7 +236,7 @@ pub async fn give(
     // 10 s (the taker dials both).
     let wait = match relays.is_empty() {
         true => {
-            tokio::spawn(irnet::fallback(ep.clone()));
+            spawn(irnet::fallback(ep.clone()));
             25
         }
         false => 10,
@@ -242,7 +246,7 @@ pub async fn give(
         bail!("no relay answers: nobody could reach a code");
     }
     let (app, pw) = (app.to_string(), Zeroizing::new(c[PLATE..].to_string()));
-    let end = tokio::spawn(async move {
+    let end = spawn(async move {
         // One try: right or wrong, the code is spent.
         let end = match timeout(TTL, answer(&ep, &app, &pw, &body, &mut rng)).await {
             Ok(Some(())) => End::Taken,
@@ -324,7 +328,7 @@ pub async fn take(
                 loop {
                     match ep.connect(at.clone(), ALPN).await {
                         Ok(c) => break c,
-                        Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
+                        Err(_) => sleep(Duration::from_secs(2)).await,
                     }
                 }
             });
@@ -376,8 +380,8 @@ async fn unlock(
     }
     let at = Instant::now();
     *HELD.lock().unwrap_or_else(|e| e.into_inner()) = Some((app.into(), code, b, at));
-    tokio::spawn(async move {
-        tokio::time::sleep(HOLD).await;
+    spawn(async move {
+        sleep(HOLD).await;
         HELD.lock().unwrap_or_else(|e| e.into_inner()).take_if(|h| h.3 == at);
     });
     bail!(if password.is_some() { "wrong password" } else { "that code has a password" })

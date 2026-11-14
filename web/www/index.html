@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- The page's own code only; the network: the lab's relays alone, as irnet
+     names them (trailing dot) and without it. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self' https://irpush.cxn.center. wss://irpush.cxn.center. https://iroh.cxn.center. wss://iroh.cxn.center. https://irpush.cxn.center wss://irpush.cxn.center https://iroh.cxn.center wss://iroh.cxn.center; style-src 'self'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>pairir</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<h1>pairir</h1>
+<p>Hand a secret to another device with a code said aloud: one minute, one try. Interoperates with the pairir apps.</p>
+
+<section>
+<h2>Give</h2>
+<textarea id="g-secret" rows="4" placeholder="secret" autocomplete="off" spellcheck="false"></textarea>
+<div class="row"><input id="g-pw" type="text" placeholder="password (optional)" autocomplete="off" spellcheck="false"><button id="g-gen" type="button">generate</button></div>
+<button id="g-go" type="button">Give</button>
+<p id="g-code" class="code"></p>
+<p id="g-out" class="out"></p>
+</section>
+
+<section>
+<h2>Take</h2>
+<input id="t-code" type="text" placeholder="k7m-x9q-p3a-b2c" autocomplete="off" spellcheck="false" autocapitalize="none">
+<input id="t-pw" type="text" placeholder="password, if it has one" autocomplete="off" spellcheck="false">
+<button id="t-go" type="button">Take</button>
+<p id="t-out" class="out"></p>
+<textarea id="t-secret" rows="4" readonly></textarea>
+<button id="t-copy" type="button">copy</button> <button id="t-clear" type="button">clear</button>
+</section>
+
+<section>
+<h2>Offline QR code</h2>
+<p>Only the password guards it: keep the generated one.</p>
+<textarea id="q-secret" rows="3" placeholder="secret, or a PAIRIR1: text to open" autocomplete="off" spellcheck="false"></textarea>
+<div class="row"><input id="q-pw" type="text" placeholder="password" autocomplete="off" spellcheck="false"><button id="q-gen" type="button">generate</button></div>
+<button id="q-seal" type="button">Seal</button> <button id="q-open" type="button">Open</button>
+<p id="q-out" class="out"></p>
+<img id="q-img" alt="">
+</section>
+
+<details><summary>Advanced</summary>
+<label>app <input id="app" type="text" value="pairir" spellcheck="false"></label>
+<p>Both ends must name the same app. Everything runs here, in this page; the relays see only sealed bytes.</p>
+</details>
+</body>
+</html>
