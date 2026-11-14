@@ -1,11 +1,14 @@
 //! pairir's API for the page's worker (www/worker.js): text in and out as
 //! bytes, on the lab's relays or, built with `PAIRIR_RELAY=<url>`, a
-//! deployment's own (add it to the CSP's connect-src).
+//! deployment's own (add it to the CSP's connect-src). Secrets and passwords
+//! in are wiped once used; secrets out go straight to the page, no copy
+//! left in wasm's memory.
 
 #![forbid(unsafe_code)]
 
-use js_sys::{Function, JsString};
+use js_sys::{Function, JsString, Uint8Array};
 use wasm_bindgen::prelude::*;
+use zeroize::Zeroizing;
 
 fn relays() -> Vec<iroh::RelayUrl> {
     option_env!("PAIRIR_RELAY")
@@ -27,6 +30,7 @@ pub async fn give(
     password: Option<String>,
     on_code: Function,
 ) -> Result<String, JsError> {
+    let (secret, password) = (Zeroizing::new(secret), Zeroizing::new(password));
     let (code, end) =
         pairir::give(&relays(), &app, &secret, password.as_deref()).await.map_err(err)?;
     on_code.call1(&JsValue::NULL, &JsString::from(code)).map_err(|_| JsError::new("on_code"))?;
@@ -34,8 +38,14 @@ pub async fn give(
 }
 
 #[wasm_bindgen]
-pub async fn take(app: String, code: String, password: Option<String>) -> Result<Vec<u8>, JsError> {
-    Ok(pairir::take(&relays(), &app, &code, password.as_deref()).await.map_err(err)?.to_vec())
+pub async fn take(
+    app: String,
+    code: String,
+    password: Option<String>,
+) -> Result<Uint8Array, JsError> {
+    let password = Zeroizing::new(password);
+    let s = pairir::take(&relays(), &app, &code, password.as_deref()).await.map_err(err)?;
+    Ok(Uint8Array::from(&s[..]))
 }
 
 #[wasm_bindgen]
@@ -45,12 +55,14 @@ pub fn password() -> String {
 
 #[wasm_bindgen]
 pub async fn seal_qr(app: String, secret: Vec<u8>, password: String) -> Result<String, JsError> {
+    let (secret, password) = (Zeroizing::new(secret), Zeroizing::new(password));
     pairir::seal_qr(&app, &secret, &password).await.map_err(err)
 }
 
 #[wasm_bindgen]
-pub async fn open_qr(app: String, text: String, password: String) -> Result<Vec<u8>, JsError> {
-    Ok(pairir::open_qr(&app, &text, &password).await.map_err(err)?.to_vec())
+pub async fn open_qr(app: String, text: String, password: String) -> Result<Uint8Array, JsError> {
+    let password = Zeroizing::new(password);
+    Ok(Uint8Array::from(&pairir::open_qr(&app, &text, &password).await.map_err(err)?[..]))
 }
 
 /// `text` as a QR code's SVG, as the apps scan it.

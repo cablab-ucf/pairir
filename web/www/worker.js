@@ -12,7 +12,7 @@ onmessage = async ({ data: { id, op, args } }) => {
     const r = op === 'give'
       ? await p.give(...args, (code) => postMessage({ id, code }))
       : await p[op](...args);
-    postMessage({ id, ok: r });
+    postMessage({ id, ok: r }, r instanceof Uint8Array ? [r.buffer] : []);
   } catch (e) {
     postMessage({ id, err: String(e?.message ?? e) });
   }

@@ -40,12 +40,16 @@ Layers, each enough alone against a recording:
   secret (giver) or the code (taker). A rigged RNG on the giver predicts
   nothing; on the taker, whose only secret is the code, only the password
   layer holds.
+- A taker given a password takes only a secret locked with it: whoever
+  heard the code cannot answer it with their own.
 - A QR code has only the password layer: use `password()` (99 bits).
 - Clocks over a minute apart cannot meet. ML-KEM and X-Wing are RustCrypto's,
   not yet independently audited.
 
 - Relays: with none given, the giver homes on irpush.cxn.center, and on
   iroh.cxn.center once that has not answered for 10 s; the taker dials both.
+  A giver on neither within 19 s fails: never on n0's, irnet's last
+  fallback, which the taker does not dial.
 
 `android/pairir`: `Qr.bitmap(text, size)` and `ScanQr` (CameraX + ZXing, no
 Play Services, under FLAG_SECURE).
@@ -59,12 +63,15 @@ deployment's own relay (add it to the CSP). A browser reaches peers through
 a relay only. Argon2id takes ~2 s there.
 
 - A page is only as trusted as whoever serves it, on every visit: a host,
-  CDN or compromised account that changes the files reads every secret. The
-  apps are trusted once, at install. Serve it from a host you control, with
-  `_headers`' CSP (a `<meta>` CSP does not reach the worker), and publish
-  SHA256SUMS, or serve `dist/` from localhost (a module worker does not
-  run from file://).
-- JavaScript strings cannot be zeroized: the secret lingers in the tab
-  until it is collected. Close the tab after.
+  CDN or compromised account that changes the files reads every secret, and
+  no CSP or SHA256SUMS on that host stops it. The apps are trusted once, at
+  install: for anything that opens other secrets, use them, or `dist/`
+  served from localhost (a module worker does not run from file://). Else
+  serve it from a host you control, with `_headers` or the same headers (a
+  `<meta>` CSP neither reaches the worker nor stops framing), and publish
+  SHA256SUMS apart from it (a signed tag or release).
+- Rust's copies are wiped; JavaScript's strings cannot be: a secret lingers
+  in the tab until collected. `clear all` reloads the page; close the tab
+  after.
 
 License: GPL-3.0-or-later.

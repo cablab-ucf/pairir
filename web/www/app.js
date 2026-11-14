@@ -10,12 +10,13 @@ w.onmessage = ({ data }) => {
 };
 const call = (op, args, code) => new Promise((ok, no) => {
   calls.set(++n, { ok, no, code });
-  w.postMessage({ id: n, op, args });
+  // Moved, not copied: the page keeps no copy of a secret it sends.
+  w.postMessage({ id: n, op, args }, args.filter((a) => a instanceof Uint8Array).map((a) => a.buffer));
 });
 
 const $ = (id) => document.getElementById(id);
 const enc = (s) => new TextEncoder().encode(s);
-const dec = (b) => new TextDecoder().decode(b);
+const dec = (b) => { const s = new TextDecoder().decode(b); b.fill(0); return s; };
 const app = () => $('app').value;
 const pw = (id) => $(id).value || undefined;
 const say = (id, s) => { $(id).textContent = s; };
@@ -45,7 +46,8 @@ $('t-go').onclick = () => busy($('t-go'), async () => {
   say('t-out', 'Taken.');
 });
 $('t-copy').onclick = () => navigator.clipboard.writeText($('t-secret').value);
-$('t-clear').onclick = () => { $('t-secret').value = ''; say('t-out', ''); };
+// All of it: every field, the worker and its memory.
+$('t-clear').onclick = () => { $('t-secret').value = ''; location.reload(); };
 
 $('q-seal').onclick = () => busy($('q-seal'), async () => {
   say('q-out', 'sealing (Argon2)...');

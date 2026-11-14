@@ -2188,6 +2188,7 @@ dependencies = [
  "qrcode",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "zeroize",
 ]
 
 [[package]]
