@@ -35,3 +35,15 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 iroh = { version = "1.4", default-features = false, features = ["tls-aws-lc-rs"] }
 iroh-relay = { version = "1.4", default-features = false, features = ["server", "tls-aws-lc-rs"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# web/: pairir for browsers. One workspace, so the wasm's build is the same
+# wherever the repo is (cargo hashes a path dependency outside it by its
+# absolute path); its profile: `--profile web`.
+[workspace]
+members = ["web"]
+
+[profile.web]
+inherits = "release"
+lto = true
+codegen-units = 1
+panic = "abort"

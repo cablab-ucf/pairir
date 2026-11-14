@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <!-- The page's own code only; the network: the lab's relays alone, as irnet
-     names them (trailing dot) and without it. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self' https://irpush.cxn.center. wss://irpush.cxn.center. https://iroh.cxn.center. wss://iroh.cxn.center. https://irpush.cxn.center wss://irpush.cxn.center https://iroh.cxn.center wss://iroh.cxn.center; style-src 'self'; img-src data:; base-uri 'none'; form-action 'none'">
+     names them (trailing dot) and without it. The worker, a blob, keeps it. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self' https://irpush.cxn.center. wss://irpush.cxn.center. https://iroh.cxn.center. wss://iroh.cxn.center. https://irpush.cxn.center wss://irpush.cxn.center https://iroh.cxn.center wss://iroh.cxn.center; style-src 'self'; img-src data:; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>pairir</title>
 <link rel="stylesheet" href="style.css">

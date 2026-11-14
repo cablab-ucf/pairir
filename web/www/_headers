@@ -1,7 +1,7 @@
-# For hosts that read _headers (Cloudflare Pages, Netlify): the worker gets
-# the page's CSP too, and the page cannot be framed.
+# For hosts that read _headers (Cloudflare Pages, Netlify): the page cannot
+# be framed, which a <meta> CSP cannot say.
 /*
-  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; connect-src 'self' https://irpush.cxn.center. wss://irpush.cxn.center. https://iroh.cxn.center. wss://iroh.cxn.center. https://irpush.cxn.center wss://irpush.cxn.center https://iroh.cxn.center wss://iroh.cxn.center; style-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self' https://irpush.cxn.center. wss://irpush.cxn.center. https://iroh.cxn.center. wss://iroh.cxn.center. https://irpush.cxn.center wss://irpush.cxn.center https://iroh.cxn.center wss://iroh.cxn.center; style-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
   Referrer-Policy: no-referrer
   X-Content-Type-Options: nosniff
   Cross-Origin-Opener-Policy: same-origin

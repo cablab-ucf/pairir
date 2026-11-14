@@ -57,10 +57,11 @@ Play Services, under FLAG_SECURE).
 `web/`: the same codes in a browser, interoperable with the apps: pairir
 compiled to wasm (irnet's pure-Rust TLS: X25519MLKEM768 still, or refused),
 run in a Web Worker, behind a CSP that admits the page's own code and the
-lab's relays alone. `web/build.sh` makes `web/dist/` (and its SHA256SUMS)
-for any static host; `PAIRIR_RELAY=<url>` at build time homes it on a
-deployment's own relay (add it to the CSP). A browser reaches peers through
-a relay only. Argon2id takes ~2 s there.
+lab's relays alone (the worker, a blob, keeps the page's CSP on any host).
+`web/build.sh` makes `web/dist/` for any static host, reproducibly (a
+commit's SHA256SUMS are the same wherever it is built); `PAIRIR_RELAY=<url>`
+at build time homes it on a deployment's own relay (add it to the CSP). A
+browser reaches peers through a relay only. Argon2id takes ~2 s there.
 
 - A page is only as trusted as whoever serves it, on every visit: a host,
   CDN or compromised account that changes the files reads every secret, and
@@ -68,8 +69,10 @@ a relay only. Argon2id takes ~2 s there.
   install: for anything that opens other secrets, use them, or `dist/`
   served from localhost (a module worker does not run from file://). Else
   serve it from a host you control, with `_headers` or the same headers (a
-  `<meta>` CSP neither reaches the worker nor stops framing), and publish
-  SHA256SUMS apart from it (a signed tag or release).
+  `<meta>` CSP cannot stop framing), and publish SHA256SUMS apart from it
+  (a signed tag or release), so anyone can rebuild and check what it serves.
+- The page refuses a password under 16 characters for giving or sealing:
+  whoever has the code or the QR text may guess it offline.
 - Rust's copies are wiped; JavaScript's strings cannot be: a secret lingers
   in the tab until collected. `clear all` reloads the page; close the tab
   after.
