@@ -17,10 +17,10 @@ use curve25519_dalek::traits::IsIdentity;
 use curve25519_dalek::{RistrettoPoint, Scalar, ristretto::CompressedRistretto};
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, RelayUrl, SecretKey, TransportAddr};
+use n0_future::task::{AbortOnDropHandle, JoinHandle, JoinSet, spawn};
+use n0_future::time::{Duration, Instant, SystemTime, sleep, timeout};
 use sha2::{Digest, Sha256, Sha512};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
-use tokio::{task::JoinSet, time::timeout};
 use x_wing::kem::Ciphertext;
 use x_wing::{Decapsulate, DecapsulationKey, Decapsulator, Encapsulate, EncapsulationKey};
 use x_wing::{KeyExport, XWingKem};
@@ -86,14 +86,18 @@ fn norm(code: &str) -> Result<String> {
 }
 
 fn minute() -> u64 {
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    let t = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
     t.map_or(0, |d| d.as_secs() / 60)
 }
 
 fn argon(secret: &[u8], salt: &[u8], out: &mut [u8], m: u32, t: u32) -> Result<()> {
     let p = argon2::Params::new(m, t, 1, None).map_err(|e| anyhow!("{e}"))?;
+    // argon2 frees its own blocks unwiped: these are wiped.
+    let mut b = Zeroizing::new(vec![]);
+    b.try_reserve_exact(p.block_count())?;
+    b.resize(p.block_count(), argon2::Block::default());
     argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, p)
-        .hash_password_into(secret, salt, out)
+        .hash_password_into_with_memory(secret, salt, out, &mut *b)
         .map_err(|e| anyhow!("{e}"))
 }
 
@@ -107,11 +111,15 @@ async fn locked(
     ensure!(!password.is_empty(), "empty password");
     let salt = [tag.as_bytes(), app.as_bytes(), b" ", &salt].concat();
     let p = Zeroizing::new(password.to_string());
-    tokio::task::spawn_blocking(move || {
+    let f = move || {
         let mut k = Zeroizing::new([0u8; 32]);
         argon(p.as_bytes(), &salt, &mut k[..], 256 << 10, 4).map(|_| k)
-    })
-    .await?
+    };
+    // A browser has no blocking pool: run pairir there in a Web Worker.
+    #[cfg(target_arch = "wasm32")]
+    return f();
+    #[cfg(not(target_arch = "wasm32"))]
+    tokio::task::spawn_blocking(f).await?
 }
 
 /// Length-value encoding (CPace's lv_cat): each part after its LEB128 length.
@@ -209,7 +217,7 @@ pub async fn give(
     app: &str,
     secret: &[u8],
     password: Option<&str>,
-) -> Result<(String, tokio::task::JoinHandle<End>)> {
+) -> Result<(String, JoinHandle<End>)> {
     ensure!(secret.len() <= SECRET, "over {SECRET} bytes: too long to hand over");
     let mut rng = hedged(&[secret, password.unwrap_or("").as_bytes()]);
     let mut c = [0u8; LEN];
@@ -229,20 +237,17 @@ pub async fn give(
     let ep = ep.alpns(vec![ALPN.to_vec()]);
     let ep = ep.bind().await?;
     // The lab's: its first relay, the next once that has not answered for
-    // 10 s (the taker dials both).
-    let wait = match relays.is_empty() {
-        true => {
-            tokio::spawn(irnet::fallback(ep.clone()));
-            25
-        }
-        false => 10,
-    };
+    // 10 s (the taker dials both); online within 19 s, before irnet joins
+    // n0's (20 s), which the taker does not dial. The fallback holds `ep`:
+    // it ends with `end`, or with this call if dropped before.
+    let fb = relays.is_empty().then(|| AbortOnDropHandle::new(spawn(irnet::fallback(ep.clone()))));
+    let wait = if fb.is_some() { 19 } else { 10 };
     if timeout(Duration::from_secs(wait), ep.online()).await.is_err() {
         ep.close().await;
         bail!("no relay answers: nobody could reach a code");
     }
     let (app, pw) = (app.to_string(), Zeroizing::new(c[PLATE..].to_string()));
-    let end = tokio::spawn(async move {
+    let end = spawn(async move {
         // One try: right or wrong, the code is spent.
         let end = match timeout(TTL, answer(&ep, &app, &pw, &body, &mut rng)).await {
             Ok(Some(())) => End::Taken,
@@ -250,6 +255,7 @@ pub async fn give(
             Err(_) => End::Expired,
         };
         ep.close().await;
+        drop(fb);
         end
     });
     Ok((code, end))
@@ -290,7 +296,9 @@ type Held = (String, String, Vec<u8>, Instant);
 static HELD: Mutex<Option<Held>> = Mutex::new(None);
 const HOLD: Duration = Duration::from_secs(600);
 
-/// The secret a short code stands for, from its giver on `relays`.
+/// The secret a short code stands for, from its giver on `relays`. With a
+/// password, only a secret locked with it: whoever heard the code could
+/// answer it with another.
 pub async fn take(
     relays: &[RelayUrl],
     app: &str,
@@ -300,8 +308,8 @@ pub async fn take(
     let code = norm(code)?;
     let held =
         HELD.lock().unwrap_or_else(|e| e.into_inner()).take_if(|h| h.0 == app && h.1 == code);
-    if let Some((_, code, b, _)) = held {
-        return unlock(app, code, b, password).await;
+    if let Some(h) = held.filter(|h| h.3.elapsed() < HOLD) {
+        return unlock(h, password).await;
     }
     let (plate, pw) = code.split_at(PLATE);
     let mut rng = hedged(&[code.as_bytes()]);
@@ -324,7 +332,7 @@ pub async fn take(
                 loop {
                     match ep.connect(at.clone(), ALPN).await {
                         Ok(c) => break c,
-                        Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
+                        Err(_) => sleep(Duration::from_secs(2)).await,
                     }
                 }
             });
@@ -349,8 +357,9 @@ pub async fn take(
     // Past the deadline above: the code is spent, so a slow Argon2 must not
     // lose its secret.
     match Zeroizing::new(body?).split_first() {
+        Some((0, _)) if password.is_some() => bail!("that code has no password: refused"),
         Some((0, s)) => Ok(Zeroizing::new(s.to_vec())),
-        Some((1, s)) => unlock(app, code, s.to_vec(), password).await,
+        Some((1, s)) => unlock((app.into(), code, s.to_vec(), Instant::now()), password).await,
         _ => bail!("not a code's secret"),
     }
 }
@@ -362,22 +371,17 @@ fn kem_open(dk: &DecapsulationKey, isk: &[u8], b: &[u8]) -> Option<Vec<u8>> {
     open(&key(isk, &*ss), rest)
 }
 
-async fn unlock(
-    app: &str,
-    code: String,
-    b: Vec<u8>,
-    password: Option<&str>,
-) -> Result<Zeroizing<Vec<u8>>> {
+async fn unlock(h: Held, password: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
     if let Some(p) = password
-        && let Some((salt, ct)) = b.split_at_checked(16)
-        && let Some(s) = open(&*locked("pairir 3 ", app, p, salt.try_into()?).await?, ct)
+        && let Some((salt, ct)) = h.2.split_at_checked(16)
+        && let Some(s) = open(&*locked("pairir 3 ", &h.0, p, salt.try_into()?).await?, ct)
     {
         return Ok(Zeroizing::new(s));
     }
-    let at = Instant::now();
-    *HELD.lock().unwrap_or_else(|e| e.into_inner()) = Some((app.into(), code, b, at));
-    tokio::spawn(async move {
-        tokio::time::sleep(HOLD).await;
+    let at = h.3;
+    *HELD.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+    spawn(async move {
+        sleep(HOLD.saturating_sub(at.elapsed())).await;
         HELD.lock().unwrap_or_else(|e| e.into_inner()).take_if(|h| h.3 == at);
     });
     bail!(if password.is_some() { "wrong password" } else { "that code has a password" })
@@ -501,6 +505,10 @@ mod tests {
         assert!(t(None).await.unwrap_err().to_string().contains("has a password"));
         assert!(t(Some("wrong")).await.unwrap_err().to_string().contains("wrong password"));
         assert_eq!(*t(Some("horse battery")).await.unwrap(), b"seed");
+        // A taker with a password refuses an answer without it.
+        let (code, _) = give(&rs, "test", b"other", None).await.unwrap();
+        let e = take(&rs, "test", &code, Some("horse battery")).await.unwrap_err();
+        assert!(e.to_string().contains("no password"));
     }
 
     /// The largest secret, locked, still fits its sealed answer; one more
