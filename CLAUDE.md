@@ -10,3 +10,7 @@
   (their alphabet, CPace, the sealing to the taker, the password layer).
   Change it only when nothing else works, keeping the old form beside the
   new.
+- A code that joins a space, starts a DM or links a device must leave
+  both sides reachable by push at once (each side's lane told, a
+  sleeping phone woken): chatir's core tests (solo.rs, net.rs) before it
+  lands.
