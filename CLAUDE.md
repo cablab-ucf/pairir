@@ -6,3 +6,7 @@
   workflow or push a tag to see whether something builds. A release is built
   once, when everything it ships is verified, merged and built as it should
   ship; not a version that is replaced hours later.
+- The wire stays compatible with chatir v0.4.5 and later: short codes
+  (their alphabet, CPace, the sealing to the taker, the password layer).
+  Change it only when nothing else works, keeping the old form beside the
+  new.
