@@ -1,0 +1,9 @@
+:root { color-scheme: light dark; font: 16px/1.4 system-ui, sans-serif; }
+body { max-width: 36rem; margin: 2rem auto; padding: 0 1rem; }
+section { margin: 2rem 0; }
+textarea, input, button { font: inherit; box-sizing: border-box; margin: .2rem 0; }
+textarea, input[type=text] { width: 100%; font-family: ui-monospace, monospace; }
+.row { display: flex; gap: .5rem; }
+.code { font: 2rem ui-monospace, monospace; letter-spacing: .1em; }
+.out { min-height: 1.4em; }
+img { max-width: 100%; background: #fff; }

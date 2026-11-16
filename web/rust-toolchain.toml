@@ -1,0 +1,4 @@
+# The toolchain dist/'s SHA256SUMS are reproduced with.
+[toolchain]
+channel = "1.97.0"
+targets = ["wasm32-unknown-unknown"]

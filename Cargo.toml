@@ -9,7 +9,7 @@ repository = "https://github.com/cablab-ucf/pairir"
 
 [dependencies]
 anyhow = "1"
-argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
 chacha20 = { version = "0.10", default-features = false, features = ["rng", "zeroize"] }
 chacha20poly1305 = "0.11"
 curve25519-dalek = { version = "5", default-features = false, features = ["zeroize"] }
@@ -17,13 +17,33 @@ data-encoding = "2"
 getrandom = "0.4"
 sha2 = "0.11"
 iroh = { version = "1.4", default-features = false }
-# The endpoint every pairing runs on: post-quantum TLS, or refused.
-irnet = { git = "https://github.com/cablab-ucf/irnet", rev = "fbd691d1b6dd34d4d2c027b6875df3f11c918f66" }
-tokio = { version = "1", features = ["rt", "time"] }
+n0-future = "0.3"
 x-wing = { version = "0.1", features = ["zeroize"] }
 zeroize = "1"
+
+# The endpoint every pairing runs on: post-quantum TLS, or refused.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+irnet = { git = "https://github.com/cablab-ucf/irnet", rev = "fbd691d1b6dd34d4d2c027b6875df3f11c918f66" }
+tokio = { version = "1", features = ["rt"] }
+
+# Browsers: irnet's pure-Rust TLS, the page's crypto.getRandomValues.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+irnet = { git = "https://github.com/cablab-ucf/irnet", rev = "fbd691d1b6dd34d4d2c027b6875df3f11c918f66", default-features = false, features = ["endpoint", "pure"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
 iroh = { version = "1.4", default-features = false, features = ["tls-aws-lc-rs"] }
 iroh-relay = { version = "1.4", default-features = false, features = ["server", "tls-aws-lc-rs"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# web/: pairir for browsers. One workspace, so the wasm's build is the same
+# wherever the repo is (cargo hashes a path dependency outside it by its
+# absolute path); its profile: `--profile web`.
+[workspace]
+members = ["web"]
+
+[profile.web]
+inherits = "release"
+lto = true
+codegen-units = 1
+panic = "abort"
