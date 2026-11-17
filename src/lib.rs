@@ -21,6 +21,7 @@ use n0_future::task::{AbortOnDropHandle, JoinHandle, JoinSet, spawn};
 use n0_future::time::{Duration, Instant, SystemTime, sleep, timeout};
 use sha2::{Digest, Sha256, Sha512};
 use std::sync::Mutex;
+use subtle::ConstantTimeEq;
 use x_wing::kem::Ciphertext;
 use x_wing::{Decapsulate, DecapsulationKey, Decapsulator, Encapsulate, EncapsulationKey};
 use x_wing::{KeyExport, XWingKem};
@@ -45,10 +46,6 @@ fn rand<const N: usize>() -> [u8; N] {
     b
 }
 
-fn same(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0, |x, (a, b)| x | (a ^ b)) == 0
-}
-
 /// OS randomness hashed with a secret (RFC 8937): a rigged RNG alone
 /// predicts nothing the secret does not.
 fn hedged(secrets: &[&[u8]]) -> ChaCha20Rng {
@@ -64,9 +61,8 @@ fn seal(key: &[u8; 32], msg: &[u8], rng: &mut ChaCha20Rng) -> Vec<u8> {
 }
 
 fn open(key: &[u8; 32], b: &[u8]) -> Option<Vec<u8>> {
-    let (n, msg) = b.split_at_checked(24)?;
-    let n: [u8; 24] = n.try_into().ok()?;
-    XChaCha20Poly1305::new(key.into()).decrypt(&n.into(), Payload { msg, aad: ALPN }).ok()
+    let (n, msg) = b.split_first_chunk::<24>()?;
+    XChaCha20Poly1305::new(key.into()).decrypt(n.into(), Payload { msg, aad: ALPN }).ok()
 }
 
 /// As typed: any case, dashes or spaces; i and l read as 1, o as 0.
@@ -279,7 +275,7 @@ async fn answer(
     let isk = isk(&y, ya, &sid, &lv(&[ya, ek, &yb, b""]))?;
     let mut got = [0u8; 32];
     rx.read_exact(&mut got).await.ok()?;
-    if !same(&got, &proof(&*isk)) {
+    if !bool::from(got.ct_eq(&proof(&*isk))) {
         return None;
     }
     let (ct, ss) = EncapsulationKey::try_from(ek).ok()?.encapsulate_with_rng(rng);
@@ -373,8 +369,8 @@ fn kem_open(dk: &DecapsulationKey, isk: &[u8], b: &[u8]) -> Option<Vec<u8>> {
 
 async fn unlock(h: Held, password: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
     if let Some(p) = password
-        && let Some((salt, ct)) = h.2.split_at_checked(16)
-        && let Some(s) = open(&*locked("pairir 3 ", &h.0, p, salt.try_into()?).await?, ct)
+        && let Some((salt, ct)) = h.2.split_first_chunk::<16>()
+        && let Some(s) = open(&*locked("pairir 3 ", &h.0, p, *salt).await?, ct)
     {
         return Ok(Zeroizing::new(s));
     }
@@ -413,9 +409,15 @@ pub async fn seal_qr(app: &str, secret: &[u8], password: &str) -> Result<String>
 
 pub async fn open_qr(app: &str, text: &str, password: &str) -> Result<Zeroizing<Vec<u8>>> {
     let body = text.trim().strip_prefix(QR).context("not an pairir QR code")?;
-    let b = data_encoding::BASE32_NOPAD.decode(body.as_bytes()).context("not an pairir QR code")?;
-    let (salt, ct) = b.split_at_checked(16).context("not an pairir QR code")?;
-    let k = locked("pairir qr 1 ", app, password, salt.try_into()?).await?;
+    let encoding = data_encoding::BASE32_NOPAD;
+    // Salt (16), nonce (24), authentication tag (16), and the payload.
+    ensure!(
+        (encoding.encode_len(56)..=encoding.encode_len(56 + QR_SECRET)).contains(&body.len()),
+        "invalid QR length"
+    );
+    let b = encoding.decode(body.as_bytes()).context("not an pairir QR code")?;
+    let (salt, ct) = b.split_first_chunk::<16>().context("not a pairir QR code")?;
+    let k = locked("pairir qr 1 ", app, password, *salt).await?;
     open(&k, ct).map(Zeroizing::new).context("wrong password, or another app's code")
 }
 
@@ -534,6 +536,13 @@ mod tests {
         assert!(open_qr("test", &t, "wrong").await.is_err());
         assert!(open_qr("other", &t, &pw).await.is_err());
         assert!(seal_qr("test", &[0; QR_SECRET + 1], &pw).await.is_err());
+        for size in [55, 56 + QR_SECRET + 1] {
+            let code = format!("{QR}{}", data_encoding::BASE32_NOPAD.encode(&vec![0; size]));
+            assert_eq!(
+                open_qr("test", &code, &pw).await.unwrap_err().to_string(),
+                "invalid QR length"
+            );
+        }
     }
 
     /// Anyone may reach the giver by its public nameplate, but one wrong
