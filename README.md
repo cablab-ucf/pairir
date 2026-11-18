@@ -42,7 +42,8 @@ Layers, each enough alone against a recording:
   layer holds.
 - A taker given a password takes only a secret locked with it: whoever
   heard the code cannot answer it with their own.
-- A QR code has only the password layer: use `password()` (99 bits).
+- A QR code has only the password layer: use `password()` (99 bits);
+  `seal_qr` refuses one under 16 characters.
 - Clocks over a minute apart cannot meet. ML-KEM and X-Wing are RustCrypto's,
   not yet independently audited.
 
