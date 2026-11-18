@@ -265,25 +265,31 @@ async fn answer(
     rng: &mut ChaCha20Rng,
 ) -> Option<()> {
     let c = ep.accept().await?.await.ok()?;
-    let (mut tx, mut rx) = c.accept_bi().await.ok()?;
-    let mut m = [0u8; 32 + EK];
-    rx.read_exact(&mut m).await.ok()?;
-    let (ya, ek) = m.split_at(32);
-    let (g, sid) = cpace(&c, app, pw).ok()?;
-    let (y, yb) = share(g, rng);
-    tx.write_all(&yb).await.ok()?;
-    let isk = isk(&y, ya, &sid, &lv(&[ya, ek, &yb, b""]))?;
-    let mut got = [0u8; 32];
-    rx.read_exact(&mut got).await.ok()?;
-    if !bool::from(got.ct_eq(&proof(&*isk))) {
-        return None;
-    }
-    let (ct, ss) = EncapsulationKey::try_from(ek).ok()?.encapsulate_with_rng(rng);
-    let ss: Zeroizing<[u8; 32]> = Zeroizing::new(ss.into());
-    tx.write_all(&[&ct[..], &seal(&key(&*isk, &*ss), body, rng)].concat()).await.ok()?;
-    tx.finish().ok()?;
-    let _ = timeout(Duration::from_secs(5), c.closed()).await;
-    Some(())
+    // Connected, the try is used within a short while: one who connects
+    // and says nothing spends it (the giver hears Spent), not holds it.
+    timeout(TRY, async {
+        let (mut tx, mut rx) = c.accept_bi().await.ok()?;
+        let mut m = [0u8; 32 + EK];
+        rx.read_exact(&mut m).await.ok()?;
+        let (ya, ek) = m.split_at(32);
+        let (g, sid) = cpace(&c, app, pw).ok()?;
+        let (y, yb) = share(g, rng);
+        tx.write_all(&yb).await.ok()?;
+        let isk = isk(&y, ya, &sid, &lv(&[ya, ek, &yb, b""]))?;
+        let mut got = [0u8; 32];
+        rx.read_exact(&mut got).await.ok()?;
+        if !bool::from(got.ct_eq(&proof(&*isk))) {
+            return None;
+        }
+        let (ct, ss) = EncapsulationKey::try_from(ek).ok()?.encapsulate_with_rng(rng);
+        let ss: Zeroizing<[u8; 32]> = Zeroizing::new(ss.into());
+        tx.write_all(&[&ct[..], &seal(&key(&*isk, &*ss), body, rng)].concat()).await.ok()?;
+        tx.finish().ok()?;
+        let _ = timeout(Duration::from_secs(5), c.closed()).await;
+        Some(())
+    })
+    .await
+    .ok()?
 }
 
 /// The last locked secret taken, for a password given within [`HOLD`] of
@@ -291,6 +297,8 @@ async fn answer(
 type Held = (String, String, Vec<u8>, Instant);
 static HELD: Mutex<Option<Held>> = Mutex::new(None);
 const HOLD: Duration = Duration::from_secs(600);
+/// A connected taker's whole exchange, at most.
+const TRY: Duration = Duration::from_secs(20);
 
 /// The secret a short code stands for, from its giver on `relays`. With a
 /// password, only a secret locked with it: whoever heard the code could
