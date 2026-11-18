@@ -403,11 +403,20 @@ pub fn password() -> String {
 
 const QR: &str = "PAIRIR1:";
 pub const QR_SECRET: usize = 2 << 10;
+/// The fewest characters a QR code's password may have, as the web page asks.
+const QR_PASSWORD: usize = 16;
 
 /// An offline QR code's text: `secret` under `password` alone (Argon2id
-/// 256 MiB, XChaCha20-Poly1305), so make it [`password`].
+/// 256 MiB, XChaCha20-Poly1305), so make it [`password`]. A password under
+/// 16 characters is refused: whoever has the text may guess it offline,
+/// with no code's one try. [`open_qr`] asks no such floor, so a
+/// code sealed before it still opens.
 pub async fn seal_qr(app: &str, secret: &[u8], password: &str) -> Result<String> {
     ensure!(secret.len() <= QR_SECRET, "over {QR_SECRET} bytes: too long for a QR code");
+    ensure!(
+        password.chars().count() >= QR_PASSWORD,
+        "a password under {QR_PASSWORD} characters can be guessed offline: generate one"
+    );
     let mut rng = hedged(&[secret, password.as_bytes()]);
     let mut salt = [0u8; 16];
     rng.fill_bytes(&mut salt);
@@ -544,6 +553,12 @@ mod tests {
         assert!(open_qr("test", &t, "wrong").await.is_err());
         assert!(open_qr("other", &t, &pw).await.is_err());
         assert!(seal_qr("test", &[0; QR_SECRET + 1], &pw).await.is_err());
+        let short = seal_qr("test", b"x", &pw[..15]).await.unwrap_err().to_string();
+        assert!(short.contains("under 16 characters"), "{short}");
+        // Sealed before the floor, with "ab": it still opens.
+        let old = "PAIRIR1:3HLFLTOFXEUOPIXGRMTMCIK5VZVEGSQAXOWXHPRA5FW6VCWCBW7K6GPCRSG6MKMP2X\
+                   YJHYRNFY3Z3CPKYX234IZOI7XC77GJ2JPMSIJENU6EZ4HNVIIPUM7U2NC3OAY";
+        assert_eq!(*open_qr("test", old, "ab").await.unwrap(), b"sealed before the floor");
         for size in [55, 56 + QR_SECRET + 1] {
             let code = format!("{QR}{}", data_encoding::BASE32_NOPAD.encode(&vec![0; size]));
             assert_eq!(
